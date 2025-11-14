@@ -28,6 +28,27 @@ This project provides a lightweight, interoperable layer so agents can:
 
 It's designed for: FastMCP clients and CLI tools (Claude Code, Codex, Gemini CLI, etc.) coordinating across one or more codebases.
 
+## From Idea Spark to Shipping Swarm
+
+If a blank repo feels daunting, follow the field-tested workflow we documented in `project_idea_and_guide.md` (“Appendix: From Blank Repo to Coordinated Swarm”):
+
+- **Ideate fast:** Write a scrappy email-style blurb about the problem, desired UX, and any must-have stack picks (≈15 minutes).
+- **Promote it to a plan:** Feed that blurb to GPT-5 Pro (and optionally Grok4 Heavy / Opus 4.1) until you get a granular Markdown plan, then iterate on the plan file while it’s still cheap to change. The Markdown Web Browser sample plan shows the level of detail to aim for.
+- **Codify the rules:** Clone a tuned `AGENTS.md`, add any tech-specific best-practice guides, and let Codex scaffold the repo plus Beads tasks straight from the plan.
+- **Spin up the swarm:** Launch multiple Codex panes (or any agent mix), register each identity with Agent Mail, and have them acknowledge `AGENTS.md`, the plan document, and the Beads backlog before touching code.
+- **Keep everyone fed:** Reuse the canned instruction cadence from the tweet thread or, better yet, let the commercial Companion app’s Message Stacks broadcast those prompts automatically so you never hand-feed panes again.
+
+Watch the full 23-minute walkthrough (https://youtu.be/68VVcqMEDrs?si=pCm6AiJAndtZ6u7q) to see the loop in action.
+
+## Productivity Math & Automation Loop
+
+One disciplined hour of GPT-5 Codex—when it isn’t waiting on human prompts—often produces 10–20 “human hours” of work because the agents reason and type at machine speed. Agent Mail multiplies that advantage in two layers:
+
+1. **Base OSS server:** Git-backed mailboxes, advisory file reservations, Typer CLI helpers, and searchable archives keep independent agents aligned without babysitting. Every instruction, lease, and attachment is auditable.
+2. **Companion stack (commercial):** The iOS app + host automation can provision, pair, and steer heterogeneous fleets (Claude Code, Codex, Gemini CLI, etc.) from your phone using customizable Message Stacks, Human Overseer broadcasts, Beads awareness, and plan editing tools—no manual tmux choreography required. The automation closes the loop by scheduling prompts, honoring Limited Mode, and enforcing Double-Arm confirmations for destructive work.
+
+Result: you invest 1–2 hours of human supervision, but dozens of agent-hours execute in parallel with clear audit trails and conflict-avoidance baked in.
+
 ## TLDR Quickstart
 
 ### One-line installer
@@ -191,6 +212,12 @@ Pitfalls to avoid
 - Protecting critical migrations with exclusive file reservations and a pre-commit guard
 - Searching and summarizing long technical discussions as threads evolve
 - Discovering and linking related projects (e.g., frontend/backend) through AI-powered suggestions
+
+## Workflow FAQ
+
+**Do I still need the tmux broadcast script to “feed” every Codex pane?**
+
+No. The historical zsh loop from the tweet thread is still handy if you are running the OSS stack by itself, but the AgentMail Companion system now automates that cadence with Message Stacks. Once the companion host services are installed, you queue presets (builder loop, reviewer sweep, test focus, etc.) from the iOS app or CLI and the automation fans those instructions out to every enrolled agent—without touching tmux.
 
 ## Architecture
 
@@ -552,6 +579,38 @@ Each bundle contains:
 - **Verifiable integrity**: SHA-256 hashes for every asset plus optional Ed25519 signing make authenticity and tampering checks straightforward.
 - **Chunk-friendly archives**: Large databases can be chunked for httpvfs streaming; a companion `chunks.sha256` file lists digests for each chunk so clients can trust streamed blobs without recomputing hashes.
 - **One-click hosting**: The interactive wizard can publish straight to GitHub Pages or Cloudflare Pages, or you can serve the bundle locally with the CLI preview command.
+
+## Disaster Recovery Archives (`archive` commands)
+
+Use the `archive` subcommands when you need a *restorable* snapshot (not just a read-only share bundle). Each ZIP under `./archived_mailbox_states/` includes:
+
+- A SQLite snapshot processed by the same cleanup pipeline as `share`, but using the `archive` scrub preset so ack/read state, recipients, attachments, and message bodies remain untouched.
+- A byte-for-byte copy of the storage Git repo (`STORAGE_ROOT`), preserving markdown artifacts, attachments, and hook scripts.
+
+### Quick ref
+
+```bash
+# Save current state (defaults to the lossless preset)
+uv run python -m mcp_agent_mail.cli archive save --label nightly
+
+# List available restore points (JSON is handy for scripts)
+uv run python -m mcp_agent_mail.cli archive list --json
+
+# Restore after a disaster (backs up any existing DB/storage before overwriting)
+uv run python -m mcp_agent_mail.cli archive restore archived_mailbox_states/<file>.zip --force
+```
+
+During restore the CLI:
+
+1. Extracts the ZIP into a temp directory.
+2. Moves any existing `storage.sqlite3`, WAL/SHM siblings, and `STORAGE_ROOT` into timestamped `.backup-<ts>` folders so nothing is lost.
+3. Copies the snapshot back to the configured database path and rebuilds the storage repo from the archive contents.
+
+Every archive writes a `metadata.json` manifest describing the projects captured, scrub preset, and a friendly reminder of the exact `archive restore …` command to run later.
+
+### Reset safety net
+
+`clear-and-reset-everything` now offers to create one of these archives before deleting anything. By default it prompts interactively; pass `--archive/--no-archive` to force a choice, and pair with `--force --no-archive` for non-interactive automation. When an archive is created successfully, the CLI prints both the path and the restore command so you can undo the reset later.
 
 ### Quick Start: Interactive Deployment Wizard
 
@@ -1473,14 +1532,69 @@ sequenceDiagram
     - `mcp-agent-mail guard install <project_key> <repo_path> --prepush`
   - Pre-commit honors `WORKTREES_ENABLED` and `AGENT_MAIL_GUARD_MODE` (`warn` advisory).
   - Pre-push enumerates to-be-pushed commits (`rev-list`) and uses `diff-tree` with `--no-ext-diff`.
+  - Composition-safe install (chain-runner):
+    - A Python chain-runner is written to `.git/hooks/pre-commit` and `.git/hooks/pre-push`.
+    - It executes `hooks.d/<hook>/*` in lexical order, then `<hook>.orig` if present (existing hooks are preserved, not overwritten).
+    - Agent Mail installs its guard as `hooks.d/pre-commit/50-agent-mail.py` and `hooks.d/pre-push/50-agent-mail.py`.
+    - Windows shims (`pre-commit.cmd/.ps1`, `pre-push.cmd/.ps1`) are written to invoke the Python chain-runner.
+  - Matching and safety details:
+    - Renames/moves are handled: both the old and new names are checked (`git diff --cached --name-status -M -z`).
+    - NUL-safe end-to-end: paths are collected and forwarded as NUL-delimited to avoid ambiguity.
+    - Git-native matching: reservations are checked using Git wildmatch pathspec semantics against repo-root relative paths; `core.ignorecase` is honored.
+    - Emergency bypass (use sparingly): set `AGENT_MAIL_BYPASS=1`, or use native Git `--no-verify`. In `warn` mode the guard never blocks.
 
-## Identity and worktree mode (opt-in)
+## Git-based project identity (opt-in)
 
-- Gate: `WORKTREES_ENABLED=1` enables worktree-friendly features. Default off.
+- Gate: `WORKTREES_ENABLED=1` or `GIT_IDENTITY_ENABLED=1` enables git-based identity features. Default off.
 - Identity modes (default `dir`): `dir`, `git-remote`, `git-toplevel`, `git-common-dir`.
 - Inspect identity for a path:
-  - Resource (MCP): `resource://identity/{/abs/path}`
+  - Resource (MCP): `resource://identity/{/abs/path}` (available when `WORKTREES_ENABLED=1`)
   - CLI (diagnostics): `mcp-agent-mail mail status /abs/path`
+
+- Precedence (when gate is on):
+  1) Committed marker `.agent-mail-project-id` (recommended)
+  2) Discovery YAML `.agent-mail.yaml` with `project_uid:`
+  3) Private marker under Git common dir `.git/agent-mail/project-id`
+  4) Remote fingerprint: normalized `origin` URL + default branch
+  5) `git-common-dir` hash; else dir hash
+
+- Migration helpers:
+  - Write committed marker: `mcp-agent-mail projects mark-identity . --commit`
+  - Scaffold discovery file: `mcp-agent-mail projects discovery-init . --product <product_uid>`
+
+Example identity payload (resource):
+
+```json
+{
+  "project_uid": "c5b2c86b-7c36-4de6-9a0a-2c4e1c3a1c4a",
+  "slug": "repo-a1b2c3d4e5",
+  "identity_mode_used": "git-remote",
+  "canonical_path": "github.com/owner/repo",
+  "human_key": "/abs/worktree/path",
+  "repo_root": "/abs/repo",
+  "git_common_dir": "/abs/repo/.git",
+  "branch": "feature/x",
+  "worktree_name": "repo-wt-x",
+  "core_ignorecase": true,
+  "normalized_remote": "github.com/owner/repo"
+}
+```
+
+## Adopt/Merge legacy projects (optional)
+
+Consolidate legacy per-worktree projects into a canonical one (safe, explicit, and auditable).
+
+- Plan the merge (no changes):
+  - `mcp-agent-mail projects adopt <from> <to> --dry-run`
+- Apply the merge (moves artifacts and re-keys DB rows):
+  - `mcp-agent-mail projects adopt <from> <to> --apply`
+- Safeguards and behavior:
+  - Requires both projects be in the same repository (validated via `git-common-dir`).
+  - Moves archived Git artifacts from `projects/<old-slug>/…` to `projects/<new-slug>/…` while preserving history.
+  - Re-keys database rows (`agents`, `messages`, `file_reservations`) from source to target project.
+  - Records `aliases.json` under the target with `"former_slugs": [...]` for discoverability.
+  - Aborts if agent-name conflicts would break uniqueness in the target (fix names, then retry).
+  - Idempotent where possible; dry-run always prints a clear plan before apply.
 
 ## Build slots and helpers (opt-in)
 
@@ -1491,6 +1605,10 @@ sequenceDiagram
   - Example: `mcp-agent-mail am-run frontend-build -- npm run dev`
 
 - Build slots (advisory, per-project coarse locking):
+  - Flags:
+    - `--ttl-seconds`: lease duration (default 3600)
+    - `--shared/--exclusive`: non-exclusive or exclusive lease (default exclusive)
+    - `--block-on-conflicts`: exit non-zero if exclusive conflicts are detected before starting
   - Acquire:
     - Tool: `acquire_build_slot(project_key, agent_name, slot, ttl_seconds=3600, exclusive=true)`
   - Renew:
@@ -1501,6 +1619,49 @@ sequenceDiagram
     - Slots are recorded under the project archive `build_slots/<slot>/<agent>__<branch>.json`
     - `exclusive=true` reports conflicts if another active exclusive holder exists
     - Intended for long-running tasks (dev servers, watchers); pair with `am-run` and `amctl env`
+
+## Product Bus
+
+Group multiple repositories (e.g., frontend, backend, infra) under a single product for product‑wide inbox/search and shared threads.
+
+- Ensure a product:
+  - `mcp-agent-mail products ensure MyProduct --name "My Product"`
+- Link a project (slug or path) into the product:
+  - `mcp-agent-mail products link MyProduct .`
+- Inspect product and linked projects:
+  - `mcp-agent-mail products status MyProduct`
+- Product‑wide message search (FTS):
+  - `mcp-agent-mail products search MyProduct "urgent AND deploy" --limit 50`
+- Product‑wide inbox:
+  - `mcp-agent-mail products inbox MyProduct Alice --limit 50 --urgent-only --include-bodies --since-ts "2025-11-01T00:00:00Z"`
+- Product‑wide thread summarization:
+  - `mcp-agent-mail products summarize-thread MyProduct "bd-123" --per-thread-limit 100 --no-llm`
+
+## Containers
+
+- Build and run locally:
+  ```bash
+  docker build -t mcp-agent-mail .
+  docker run --rm -p 8765:8765 \
+    -e HTTP_HOST=0.0.0.0 \
+    -e STORAGE_ROOT=/data/mailbox \
+    -v agent_mail_data:/data \
+    mcp-agent-mail
+  ```
+- Or with Compose:
+  ```bash
+  docker compose up --build
+  ```
+- Notes:
+  - Runs as an unprivileged user (`appuser`, uid 10001).
+  - Includes a HEALTHCHECK against `/health/liveness`.
+  - The server reads config from `.env` via python-decouple. You can mount it read-only into the container at `/app/.env`.
+  - Default bind host is `0.0.0.0` in the container; port `8765` is exposed.
+  - Persistent archive lives under `/data/mailbox` (mapped to the `agent_mail_data` volume by default).
+
+Notes
+- A unique `product_uid` is stored for each product; you can reference a product by uid or name.
+- Server tools also exist for orchestration: `ensure_product`, `products_link`, `search_messages_product`, and `resource://product/{key}`.
 
 
 Exclusive file reservations are advisory but visible and auditable:
@@ -2002,7 +2163,7 @@ The project exposes a developer CLI for common operations:
 - `share decrypt <encrypted_path> [--identity <file> | --passphrase]`: decrypt an age-encrypted bundle
 - `config set-port <port>`: change the HTTP server port (updates .env)
 - `config show-port`: display the current configured HTTP port
-- `clear-and-reset-everything [--force]`: DELETE the SQLite database (incl. WAL/SHM) and WIPE all contents under `STORAGE_ROOT` (including per-project Git archives). Use only when you intentionally want a clean slate.
+- `clear-and-reset-everything [--force] [--archive/--no-archive]`: DELETE the SQLite database (incl. WAL/SHM) and WIPE all contents under `STORAGE_ROOT` after optionally saving a restore point. Without flags it prompts to create an archive first; `--force --no-archive` skips all prompts for automation.
 - `list-acks --project <key> --agent <name> [--limit N]`: list messages requiring acknowledgement for an agent where ack is missing
 - `acks pending <project> <agent> [--limit N]`: show pending acknowledgements for an agent
 - `acks remind <project> <agent> [--min-age-minutes N] [--limit N]`: highlight pending ACKs older than a threshold

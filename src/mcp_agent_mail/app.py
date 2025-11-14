@@ -32,7 +32,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency fallback
     PathSpec = None  # type: ignore[assignment]
     GitWildMatchPattern = None  # type: ignore[assignment]
-from sqlalchemy import asc, desc, func, or_, select, text, update
+from sqlalchemy import asc, bindparam, desc, func, or_, select, text, update
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm import aliased
 
@@ -49,6 +49,8 @@ from .models import (
     MessageRecipient,
     Project,
     ProjectSiblingSuggestion,
+    Product,
+    ProductProjectLink,
 )
 from .storage import (
     ProjectArchive,
@@ -80,6 +82,7 @@ CLUSTER_SEARCH = "search"
 CLUSTER_FILE_RESERVATIONS = "file_reservations"
 CLUSTER_MACROS = "workflow_macros"
 CLUSTER_BUILD_SLOTS = "build_slots"
+CLUSTER_PRODUCT = "product_bus"
 
 
 class ToolExecutionError(Exception):
@@ -384,7 +387,7 @@ def _split_slug_and_query(raw_value: str) -> tuple[str, dict[str, str]]:
     slug, _, query_string = raw_value.partition("?")
     if not query_string:
         return slug, {}
-    params = cast(dict[str, str], dict(parse_qsl(query_string, keep_blank_values=True)))
+    params = dict(parse_qsl(query_string, keep_blank_values=True))
     return slug, params
 
 
@@ -755,7 +758,13 @@ def _compute_project_slug(human_key: str) -> str:
     if mode == "git-common-dir":
         try:
             repo = Repo(human_key, search_parent_directories=True)
-            gdir = repo.git.rev_parse("--git-common-dir").strip()
+            # Prefer GitPython's common_dir which normalizes worktree paths
+            try:
+                gdir = getattr(repo, "common_dir", None)
+            except Exception:
+                gdir = None
+            if not gdir:
+                gdir = repo.git.rev_parse("--git-common-dir").strip()
             if gdir:
                 from pathlib import Path as _P
 
@@ -797,26 +806,75 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
             return None
         u = url.strip()
         try:
-            if u.startswith("git@"):
-                host = u.split("@", 1)[1].split(":", 1)[0]
-                path = u.split(":", 1)[1]
+            host = ""
+            path = ""
+            # SCP-like: git@host:owner/repo.git
+            if "@" in u and ":" in u and not u.startswith(("http://", "https://", "ssh://", "git://")):
+                at_pos = u.find("@")
+                colon_pos = u.find(":", at_pos + 1)
+                if colon_pos != -1:
+                    host = u[at_pos + 1 : colon_pos]
+                    path = u[colon_pos + 1 :]
             else:
                 from urllib.parse import urlparse as _urlparse
-                p = _urlparse(u)
-                host = p.hostname or ""
-                path = (p.path or "")
+                pr = _urlparse(u)
+                host = (pr.hostname or "").lower()
+                # Some ssh URLs include port; ignore
+                path = (pr.path or "")
+            host = host.lower()
+            if not host:
+                return None
+            path = path.lstrip("/")
+            if path.endswith(".git"):
+                path = path[:-4]
+            # collapse duplicate slashes
+            while "//" in path:
+                path = path.replace("//", "/")
+            parts = [seg for seg in path.split("/") if seg]
+            if len(parts) < 2:
+                return None
+            # Keep the last two segments (owner/repo) and normalize to lowercase
+            # This supports nested group paths (e.g., GitLab subgroups)
+            if len(parts) >= 2:
+                owner, repo_name = parts[-2].lower(), parts[-1].lower()
+            else:
+                return None
+            return f"{host}/{owner}/{repo_name}"
         except Exception:
             return None
-        if not host:
-            return None
-        path = path.lstrip("/")
-        if path.endswith(".git"):
-            path = path[:-4]
-        parts = [seg for seg in path.split("/") if seg]
-        if len(parts) < 2:
-            return None
-        owner, repo_name = parts[0], parts[1]
-        return f"{host}/{owner}/{repo_name}"
+
+    # Discovery YAML: optional override
+    def _read_discovery_yaml(base_dir: str) -> dict[str, Any]:
+        try:
+            ypath = Path(base_dir) / ".agent-mail.yaml"
+            if not ypath.exists():
+                return {}
+            # Prefer PyYAML when available for robust parsing; fallback to minimal parser
+            try:
+                import yaml as _yaml  # type: ignore
+                loaded = _yaml.safe_load(ypath.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    # Keep only known keys to avoid surprises
+                    allowed = {"project_uid", "product_uid"}
+                    return {k: str(v) for k, v in loaded.items() if k in allowed and isinstance(v, (str, int))}
+                return {}
+            except Exception:
+                data = {}
+                for line in ypath.read_text(encoding="utf-8").splitlines():
+                    s = line.strip()
+                    if not s or s.startswith("#") or ":" not in s:
+                        continue
+                    key, value = s.split(":", 1)
+                    k = key.strip()
+                    if k not in {"project_uid", "product_uid"}:
+                        continue
+                    # strip inline comments
+                    v = value.split("#", 1)[0].strip().strip("'\"")
+                    if v:
+                        data[k] = v
+                return data
+        except Exception:
+            return {}
 
     try:
         repo = Repo(target_path, search_parent_directories=True)
@@ -865,15 +923,29 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
     else:
         canonical_path = target_path
 
-    # Compute project_uid via precedence: committed marker -> private marker -> remote fingerprint -> git-common-dir hash -> dir hash
+    # Compute project_uid via precedence:
+    # committed marker -> discovery yaml -> private marker -> remote fingerprint -> git-common-dir hash -> dir hash
     marker_committed: Optional[Path] = Path(repo_root or "") / ".agent-mail-project-id" if repo_root else None
     marker_private: Optional[Path] = Path(git_common_dir or "") / "agent-mail" / "project-id" if git_common_dir else None
+    # Normalize marker_private to absolute if git_common_dir is relative (common for non-linked worktrees)
+    if marker_private is not None and not marker_private.is_absolute():
+        try:
+            base = Path(repo_root or target_path)
+            marker_private = (base / marker_private).resolve()
+        except Exception:
+            pass
+    discovery: dict[str, Any] = _read_discovery_yaml(repo_root or target_path)
     project_uid: Optional[str] = None
     try:
         if marker_committed and marker_committed.exists():
             project_uid = (marker_committed.read_text(encoding="utf-8").strip() or None)
     except Exception:
         project_uid = None
+    if not project_uid:
+        # Discovery yaml override
+        uid = str(discovery.get("project_uid", "")).strip() if discovery else ""
+        if uid:
+            project_uid = uid
     if not project_uid:
         try:
             if marker_private and marker_private.exists():
@@ -931,6 +1003,7 @@ def _resolve_project_identity(human_key: str) -> dict[str, Any]:
         "core_ignorecase": core_ignorecase,
         "normalized_remote": normalized_remote,
         "project_uid": project_uid,
+        "discovery": discovery or None,
     }
     # Rich-styled identity decision logging (optional)
     try:
@@ -1768,7 +1841,7 @@ def _file_reservations_conflict(existing: FileReservation, candidate_path: str, 
     def _normalize(p: str) -> str:
         return p.replace("\\", "/").lstrip("/")
     if PathSpec and GitWildMatchPattern:
-        spec = PathSpec.from_lines(GitWildMatchPattern, [existing.path_pattern])
+        spec = PathSpec.from_lines("gitwildmatch", [existing.path_pattern])
         return spec.match_file(_normalize(candidate_path))
     # Fallback to conservative fnmatch if pathspec not available
     pat = existing.path_pattern
@@ -1782,8 +1855,8 @@ def _patterns_overlap(a: str, b: str) -> bool:
     def _normalize(p: str) -> str:
         return p.replace("\\", "/").lstrip("/")
     if PathSpec and GitWildMatchPattern:
-        a_spec = PathSpec.from_lines(GitWildMatchPattern, [a])
-        b_spec = PathSpec.from_lines(GitWildMatchPattern, [b])
+        a_spec = PathSpec.from_lines("gitwildmatch", [a])
+        b_spec = PathSpec.from_lines("gitwildmatch", [b])
         # Heuristic: check direct cross-matches on normalized patterns
         return a_spec.match_file(_normalize(b)) or b_spec.match_file(_normalize(a))
     # Fallback approximate
@@ -2214,6 +2287,13 @@ def build_mcp_server() -> FastMCP:
 
     mcp = FastMCP(name="mcp-agent-mail", instructions=instructions, lifespan=lifespan)
 
+    async def _ctx_info_safe(ctx: Context, message: str) -> None:
+        try:
+            await ctx.info(message)
+        except Exception:
+            # Context may not be available outside of a request; ignore logging
+            return
+
     async def _deliver_message(
         ctx: Context,
         tool_name: str,
@@ -2507,7 +2587,7 @@ def build_mcp_server() -> FastMCP:
                 "or 'C:\\projects\\backend' on Windows)."
             )
 
-        await ctx.info(f"Ensuring project for key '{human_key}'.")
+        await _ctx_info_safe(ctx, f"Ensuring project for key '{human_key}'.")
         project = await _ensure_project(human_key)
         await ensure_archive(settings, project.slug)
         # Compose identity metadata similar to resource://identity
@@ -4942,7 +5022,7 @@ def build_mcp_server() -> FastMCP:
         project = await _get_project_by_identifier(project_key)
         repo_path = Path(code_repo_path).expanduser().resolve()
         hook_path = await install_guard_script(settings, project.slug, repo_path)
-        await ctx.info(f"Installed pre-commit guard for project '{project.human_key}' at {hook_path}.")
+        await _ctx_info_safe(ctx, f"Installed pre-commit guard for project '{project.human_key}' at {hook_path}.")
         return {"hook": str(hook_path)}
 
     @mcp.tool(name="uninstall_precommit_guard")
@@ -4964,9 +5044,9 @@ def build_mcp_server() -> FastMCP:
         repo_path = Path(code_repo_path).expanduser().resolve()
         removed = await uninstall_guard_script(repo_path)
         if removed:
-            await ctx.info(f"Removed pre-commit guard at {repo_path / '.git/hooks/pre-commit'}.")
+            await _ctx_info_safe(ctx, f"Removed pre-commit guard at {repo_path / '.git/hooks/pre-commit'}.")
         else:
-            await ctx.info(f"No pre-commit guard to remove at {repo_path / '.git/hooks/pre-commit'}.")
+            await _ctx_info_safe(ctx, f"No pre-commit guard to remove at {repo_path / '.git/hooks/pre-commit'}.")
         return {"removed": removed}
 
     @mcp.tool(name="file_reservation_paths")
@@ -5705,16 +5785,364 @@ def build_mcp_server() -> FastMCP:
             },
         }
 
-    @mcp.resource("resource://identity/{project}", mime_type="application/json")
-    def identity_resource(project: str) -> dict[str, Any]:
-        """
-        Inspect identity resolution for a given project path. Returns the slug actually used,
-        the identity mode in effect, canonical path for the selected mode, and git repo facts.
-        """
-        raw_path, _ = _split_slug_and_query(project)
-        target_path = str(Path(raw_path).expanduser().resolve())
+    # --- Product Bus (Phase 2): ensure/link/search/resources ---------------------------------
 
-        return _resolve_project_identity(target_path)
+    async def _get_product_by_key(session, key: str) -> Optional[Product]:
+        # Key may match product_uid or name (case-sensitive by default)
+        stmt = select(Product).where((Product.product_uid == key) | (Product.name == key))
+        res = await session.execute(stmt)
+        return res.scalars().first()
+
+    if settings.worktrees_enabled:
+        @mcp.tool(name="ensure_product")
+        @_instrument_tool("ensure_product", cluster=CLUSTER_PRODUCT, capabilities={"product"})
+        async def ensure_product_tool(
+            ctx: Context,
+            product_key: Optional[str] = None,
+            name: Optional[str] = None,
+        ) -> dict[str, Any]:
+            """
+            Ensure a Product exists. If not, create one.
+
+            - product_key may be a product_uid or a name
+            - If both are absent, error
+            """
+            await ensure_schema()
+            key_raw = (product_key or name or "").strip()
+            if not key_raw:
+                raise ToolExecutionError("INVALID_ARGUMENT", "Provide product_key or name.")
+            async with get_session() as session:
+                prod = await _get_product_by_key(session, key_raw)
+                if prod is None:
+                    # Create with strict uid pattern; otherwise generate uid and normalize name
+                    import uuid as _uuid
+                    import re as _re
+                    uid_pattern = _re.compile(r"^[A-Fa-f0-9]{8,64}$")
+                    if product_key and uid_pattern.fullmatch(product_key.strip()):
+                        uid = product_key.strip().lower()
+                    else:
+                        uid = _uuid.uuid4().hex[:20]
+                    display_name = (name or key_raw).strip()
+                    # Collapse internal whitespace and cap length
+                    display_name = " ".join(display_name.split())[:255] or uid
+                    prod = Product(product_uid=uid, name=display_name)
+                    session.add(prod)
+                    await session.commit()
+                    await session.refresh(prod)
+            return {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name, "created_at": _iso(prod.created_at)}
+    else:
+        async def ensure_product_tool(ctx: Context, product_key: Optional[str] = None, name: Optional[str] = None) -> dict[str, Any]:
+            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
+
+    if settings.worktrees_enabled:
+        @mcp.tool(name="products_link")
+        @_instrument_tool("products_link", cluster=CLUSTER_PRODUCT, capabilities={"product"}, project_arg="project_key")
+        async def products_link_tool(
+            ctx: Context,
+            product_key: str,
+            project_key: str,
+        ) -> dict[str, Any]:
+            """
+            Link a project into a product (idempotent).
+            """
+            await ensure_schema()
+            async with get_session() as session:
+                prod = await _get_product_by_key(session, product_key.strip())
+                if prod is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Product '{product_key}' not found.", recoverable=True)
+                # Resolve project
+                project = await _get_project_by_identifier(project_key)
+                if project.id is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Project '{project_key}' not found.", recoverable=True)
+                # Link if missing
+                existing = await session.execute(
+                    select(ProductProjectLink).where(
+                        ProductProjectLink.product_id == cast(Any, prod.id),
+                        ProductProjectLink.project_id == cast(Any, project.id),
+                    )
+                )
+                link = existing.scalars().first()
+                if link is None:
+                    link = ProductProjectLink(product_id=int(prod.id), project_id=int(project.id))
+                    session.add(link)
+                    await session.commit()
+                    await session.refresh(link)
+                return {
+                    "product": {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name},
+                    "project": {"id": project.id, "slug": project.slug, "human_key": project.human_key},
+                    "linked": True,
+                }
+    else:
+        async def products_link_tool(ctx: Context, product_key: str, project_key: str) -> dict[str, Any]:
+            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
+
+    if settings.worktrees_enabled:
+        @mcp.resource("resource://product/{key}", mime_type="application/json")
+        def product_resource(key: str) -> dict[str, Any]:
+            """
+            Inspect product and list linked projects.
+            """
+            # Safe runner that works even if an event loop is already running
+            def _run_coro_sync(coro):
+                try:
+                    asyncio.get_running_loop()
+                    # Run in a separate thread to avoid nested loop issues
+                except RuntimeError:
+                    return asyncio.run(coro)
+                import threading  # type: ignore
+                import queue  # type: ignore
+                q: "queue.Queue[tuple[bool, Any]]" = queue.Queue()
+                def _runner():
+                    try:
+                        q.put((True, asyncio.run(coro)))
+                    except Exception as e:
+                        q.put((False, e))
+                t = threading.Thread(target=_runner, daemon=True)
+                t.start()
+                ok, val = q.get()
+                if ok:
+                    return val
+                raise val
+            async def _load() -> dict[str, Any]:
+                await ensure_schema()
+                async with get_session() as session:
+                    prod = await _get_product_by_key(session, key.strip())
+                    if prod is None:
+                        raise ToolExecutionError("NOT_FOUND", f"Product '{key}' not found.", recoverable=True)
+                    proj_rows = await session.execute(
+                        select(Project).join(ProductProjectLink, ProductProjectLink.project_id == Project.id).where(
+                            ProductProjectLink.product_id == cast(Any, prod.id)
+                        )
+                    )
+                    projects = [
+                        {"id": p.id, "slug": p.slug, "human_key": p.human_key, "created_at": _iso(p.created_at)}
+                        for p in proj_rows.scalars().all()
+                    ]
+                    return {
+                        "id": prod.id,
+                        "product_uid": prod.product_uid,
+                        "name": prod.name,
+                        "created_at": _iso(prod.created_at),
+                        "projects": projects,
+                    }
+            # Run async in a synchronous resource
+            return _run_coro_sync(_load())
+
+    if settings.worktrees_enabled:
+        @mcp.tool(name="search_messages_product")
+        @_instrument_tool("search_messages_product", cluster=CLUSTER_PRODUCT, capabilities={"search"})
+        async def search_messages_product(
+            ctx: Context,
+            product_key: str,
+            query: str,
+            limit: int = 20,
+        ) -> Any:
+            """
+            Full-text search across all projects linked to a product.
+            """
+            await ensure_schema()
+            async with get_session() as session:
+                prod = await _get_product_by_key(session, product_key.strip())
+                if prod is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Product '{product_key}' not found.", recoverable=True)
+                proj_ids_rows = await session.execute(
+                    select(ProductProjectLink.project_id).where(ProductProjectLink.product_id == cast(Any, prod.id))
+                )
+                proj_ids = [int(row[0]) for row in proj_ids_rows.fetchall()]
+                if not proj_ids:
+                    return []
+                # FTS search limited to projects in proj_ids
+                result = await session.execute(
+                    text(
+                        """
+                        SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                               m.thread_id, a.name AS sender_name, m.project_id
+                        FROM fts_messages
+                        JOIN messages m ON fts_messages.rowid = m.id
+                        JOIN agents a ON m.sender_id = a.id
+                        WHERE m.project_id IN :proj_ids AND fts_messages MATCH :query
+                        ORDER BY bm25(fts_messages) ASC
+                        LIMIT :limit
+                        """
+                    ).bindparams(bindparam("proj_ids", expanding=True)),
+                    {"proj_ids": proj_ids, "query": query, "limit": limit},
+                )
+                rows = result.mappings().all()
+            items = [
+                {
+                    "id": row["id"],
+                    "subject": row["subject"],
+                    "importance": row["importance"],
+                    "ack_required": row["ack_required"],
+                    "created_ts": _iso(row["created_ts"]),
+                    "thread_id": row["thread_id"],
+                    "from": row["sender_name"],
+                    "project_id": row["project_id"],
+                }
+                for row in rows
+            ]
+            try:
+                from fastmcp.tools.tool import ToolResult  # type: ignore
+                return ToolResult(structured_content={"result": items})
+            except Exception:
+                return items
+    else:
+        async def search_messages_product(ctx: Context, product_key: str, query: str, limit: int = 20) -> Any:
+            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
+
+    if settings.worktrees_enabled:
+        @mcp.tool(name="fetch_inbox_product")
+        @_instrument_tool("fetch_inbox_product", cluster=CLUSTER_PRODUCT, capabilities={"messaging", "read"})
+        async def fetch_inbox_product(
+            ctx: Context,
+            product_key: str,
+            agent_name: str,
+            limit: int = 20,
+            urgent_only: bool = False,
+            include_bodies: bool = False,
+            since_ts: Optional[str] = None,
+        ) -> list[dict[str, Any]]:
+            """
+            Retrieve recent messages for an agent across all projects linked to a product (non-mutating).
+            """
+            await ensure_schema()
+            # Collect linked projects
+            async with get_session() as session:
+                prod = await _get_product_by_key(session, product_key.strip())
+                if prod is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Product '{product_key}' not found.", recoverable=True)
+                proj_rows = await session.execute(
+                    select(Project).join(ProductProjectLink, ProductProjectLink.project_id == Project.id).where(
+                        ProductProjectLink.product_id == cast(Any, prod.id)
+                    )
+                )
+                projects: list[Project] = list(proj_rows.scalars().all())
+            # For each project, if agent exists, list inbox items
+            messages: list[dict[str, Any]] = []
+            for project in projects:
+                try:
+                    ag = await _get_agent(project, agent_name)
+                except Exception:
+                    continue
+                proj_items = await _list_inbox(project, ag, limit, urgent_only, include_bodies, since_ts)
+                for item in proj_items:
+                    item["project_id"] = item.get("project_id") or project.id
+                    messages.append(item)
+            # Sort by created_ts desc and trim to limit
+            def _dt_key(it: dict[str, Any]) -> float:
+                ts = _parse_iso(str(it.get("created_ts") or ""))
+                return ts.timestamp() if ts else 0.0
+            messages.sort(key=_dt_key, reverse=True)
+            return messages[: max(0, int(limit))]
+    else:
+        async def fetch_inbox_product(ctx: Context, product_key: str, agent_name: str, limit: int = 20, urgent_only: bool = False, include_bodies: bool = False, since_ts: Optional[str] = None) -> list[dict[str, Any]]:
+            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
+
+    if settings.worktrees_enabled:
+        @mcp.tool(name="summarize_thread_product")
+        @_instrument_tool("summarize_thread_product", cluster=CLUSTER_PRODUCT, capabilities={"summarization", "search"})
+        async def summarize_thread_product(
+            ctx: Context,
+            product_key: str,
+            thread_id: str,
+            include_examples: bool = False,
+            llm_mode: bool = True,
+            llm_model: Optional[str] = None,
+            per_thread_limit: Optional[int] = None,
+        ) -> dict[str, Any]:
+            """
+            Summarize a thread (by id or thread key) across all projects linked to a product.
+            """
+            await ensure_schema()
+            sender_alias = aliased(Agent)
+            try:
+                seed_id = int(thread_id)
+            except ValueError:
+                seed_id = None
+            criteria = [Message.thread_id == thread_id]
+            if seed_id is not None:
+                criteria.append(Message.id == seed_id)
+
+            async with get_session() as session:
+                prod = await _get_product_by_key(session, product_key.strip())
+                if prod is None:
+                    raise ToolExecutionError("NOT_FOUND", f"Product '{product_key}' not found.", recoverable=True)
+                proj_ids_rows = await session.execute(
+                    select(ProductProjectLink.project_id).where(ProductProjectLink.product_id == cast(Any, prod.id))
+                )
+                proj_ids = [int(row[0]) for row in proj_ids_rows.fetchall()]
+                if not proj_ids:
+                    return {"thread_id": thread_id, "summary": {"participants": [], "key_points": [], "action_items": [], "total_messages": 0}, "examples": []}
+                stmt = (
+                    select(Message, sender_alias.name)
+                    .join(sender_alias, Message.sender_id == sender_alias.id)
+                    .where(cast(Any, Message.project_id).in_(proj_ids), or_(*criteria))
+                    .order_by(asc(Message.created_ts))
+                )
+                if per_thread_limit:
+                    stmt = stmt.limit(per_thread_limit)
+                rows = (await session.execute(stmt)).all()
+            summary = _summarize_messages(rows)
+
+            # Optional LLM refinement (same as project-level)
+            if llm_mode and get_settings().llm.enabled:
+                try:
+                    excerpts: list[str] = []
+                    for message, sender_name in rows[:15]:
+                        excerpts.append(f"- {sender_name}: {message.subject}\n{message.body_md[:800]}")
+                    if excerpts:
+                        system = (
+                            "You are a senior engineer. Produce a concise JSON summary with keys: "
+                            "participants[], key_points[], action_items[], mentions[{name,count}], code_references[], "
+                            "total_messages, open_actions, done_actions. Derive from the given thread excerpts."
+                        )
+                        user = "\n\n".join(excerpts)
+                        llm_resp = await complete_system_user(system, user, model=llm_model)
+                        parsed = _parse_json_safely(llm_resp.content)
+                        if parsed:
+                            for key in (
+                                "participants",
+                                "key_points",
+                                "action_items",
+                                "mentions",
+                                "code_references",
+                                "total_messages",
+                                "open_actions",
+                                "done_actions",
+                            ):
+                                value = parsed.get(key)
+                                if value:
+                                    summary[key] = value
+                except Exception as e:
+                    await ctx.debug(f"summarize_thread_product.llm_skipped: {e}")
+
+            examples: list[dict[str, Any]] = []
+            if include_examples:
+                for message, sender_name in rows[:3]:
+                    examples.append(
+                        {
+                            "id": message.id,
+                            "subject": message.subject,
+                            "from": sender_name,
+                            "created_ts": _iso(message.created_ts),
+                        }
+                    )
+            await ctx.info(f"Summarized thread '{thread_id}' across product '{product_key}' with {len(rows)} messages")
+            return {"thread_id": thread_id, "summary": summary, "examples": examples}
+    else:
+        async def summarize_thread_product(ctx: Context, product_key: str, thread_id: str, include_examples: bool = False, llm_mode: bool = True, llm_model: Optional[str] = None, per_thread_limit: Optional[int] = None) -> dict[str, Any]:
+            raise ToolExecutionError("FEATURE_DISABLED", "Product Bus is disabled. Enable WORKTREES_ENABLED to use this tool.")
+    if settings.worktrees_enabled:
+        @mcp.resource("resource://identity/{project}", mime_type="application/json")
+        def identity_resource(project: str) -> dict[str, Any]:
+            """
+            Inspect identity resolution for a given project path. Returns the slug actually used,
+            the identity mode in effect, canonical path for the selected mode, and git repo facts.
+            """
+            raw_path, _ = _split_slug_and_query(project)
+            target_path = str(Path(raw_path).expanduser().resolve())
+
+            return _resolve_project_identity(target_path)
     @mcp.resource("resource://tooling/directory", mime_type="application/json")
     def tooling_directory_resource() -> dict[str, Any]:
         """

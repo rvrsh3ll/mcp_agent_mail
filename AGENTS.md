@@ -102,18 +102,34 @@ Macros vs granular tools
 ### Worktree recipes (opt-in, non-disruptive)
 
 - Enable gated features:
-  - Set `WORKTREES_ENABLED=1` in `.env` (do not commit secrets; config is loaded via `python-decouple`).
+  - Set `WORKTREES_ENABLED=1` or `GIT_IDENTITY_ENABLED=1` in `.env` (do not commit secrets; config is loaded via `python-decouple`).
   - For trial posture, set `AGENT_MAIL_GUARD_MODE=warn` to surface conflicts without blocking.
 - Inspect identity for a worktree:
   - CLI: `mcp-agent-mail mail status .`
-  - Resource: `resource://identity/{/abs/path}`
+  - Resource: `resource://identity/{/abs/path}` (available only when `WORKTREES_ENABLED=1`)
 - Install guards (chain-runner friendly; honors `core.hooksPath` and Husky):
   - `mcp-agent-mail guard status .`
   - `mcp-agent-mail guard install <project_key> . --prepush`
   - Guards exit early when `WORKTREES_ENABLED=0` or `AGENT_MAIL_BYPASS=1`.
+- Composition details:
+  - Installer writes a Python chain-runner to `.git/hooks/pre-commit` and `.git/hooks/pre-push` that executes `hooks.d/<hook>/*` and then `<hook>.orig` if present.
+  - Agent Mail guard is installed as `hooks.d/pre-commit/50-agent-mail.py` and `hooks.d/pre-push/50-agent-mail.py`.
+  - On Windows, `.cmd` and `.ps1` shims are written alongside the chain-runner to invoke Python.
 - Reserve before you edit:
   - `file_reservation_paths(project_key, agent_name, ["src/**"], ttl_seconds=3600, exclusive=true)`
   - Patterns use Git pathspec semantics and respect repository `core.ignorecase`.
+
+### Git-based identity: precedence and migration
+
+- Precedence (when gate is on):
+  1) Committed marker `.agent-mail-project-id`
+  2) Discovery YAML `.agent-mail.yaml` with `project_uid:`
+  3) Private marker `.git/agent-mail/project-id`
+  4) Remote fingerprint: normalized `origin` + default branch
+  5) `git-common-dir` or path hash
+- Migration helpers (CLI):
+  - Write committed marker: `mcp-agent-mail projects mark-identity . --commit`
+  - Scaffold discovery YAML: `mcp-agent-mail projects discovery-init . --product <product_uid>`
 
 ### Guard usage quickstart
 
@@ -136,7 +152,28 @@ Macros vs granular tools
   - `release_build_slot(project_key, agent_name, "frontend-build")`
 - Tips:
   - Combine with `mcp-agent-mail amctl env --path . --agent $AGENT_NAME` to get `CACHE_KEY` and `ARTIFACT_DIR`.
-  - Use `mcp-agent-mail am-run <slot> -- <cmd...>` to run with prepped env; future versions will auto-acquire/renew/release.
+  - Use `mcp-agent-mail am-run <slot> -- <cmd...>` to run with prepped env; flags include `--ttl-seconds`, `--shared/--exclusive`, and `--block-on-conflicts`. Future versions will auto-acquire/renew/release.
+
+### Product Bus
+
+- Create or ensure a product:
+  - `mcp-agent-mail products ensure MyProduct --name "My Product"`
+- Link a repo/worktree into the product (use slug or path):
+  - `mcp-agent-mail products link MyProduct .`
+- View product status and linked projects:
+  - `mcp-agent-mail products status MyProduct`
+- Search messages across all linked projects:
+  - `mcp-agent-mail products search MyProduct "bd-123 OR \"release plan\"" --limit 50`
+- Product-wide inbox for an agent:
+  - `mcp-agent-mail products inbox MyProduct YourAgent --limit 50 --urgent-only --include-bodies`
+- Product-wide thread summarization:
+  - `mcp-agent-mail products summarize-thread MyProduct "bd-123" --per-thread-limit 100 --no-llm`
+
+Server tools (for orchestrators)
+- `ensure_product(product_key|name)`
+- `products_link(product_key, project_key)`
+- `resource://product/{key}`
+- `search_messages_product(product_key, query, limit=20)`
 
 Common pitfalls
 - "from_agent not registered": always `register_agent` in the correct `project_key` first.

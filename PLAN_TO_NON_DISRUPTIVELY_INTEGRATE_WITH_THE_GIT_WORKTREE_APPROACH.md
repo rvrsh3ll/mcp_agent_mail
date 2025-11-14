@@ -119,6 +119,17 @@ Implementation progress:
     - Pre-push hook now:
       - Honors `AGENT_MAIL_BYPASS=1` and `AGENT_MAIL_GUARD_MODE=warn`.
       - Uses `rev-list` + `diff-tree` and `--no-ext-diff` for correct ranges and NUL-safety.
+  - 2025-11-10: Chain-runner hooks implemented (composition-safe):
+    - Installer writes a Python chain-runner at `.git/hooks/pre-commit` and `.git/hooks/pre-push` that executes `hooks.d/<hook>/*` in lexical order and then `<hook>.orig` if present.
+    - Existing single-file hooks are preserved as `<hook>.orig` on first install; no overwrites.
+    - Agent Mail guard is installed as `hooks.d/pre-commit/50-agent-mail.py` and `hooks.d/pre-push/50-agent-mail.py`.
+    - Pre-push chain-runner reads STDIN once and forwards it to child hooks, matching Git’s tuple semantics.
+    - Uninstall removes only our `50-agent-mail.py` plugins; chain-runner and user hooks remain intact. Legacy single-file Agent Mail hooks are still removed if detected by sentinel.
+  - 2025-11-10: Unified guard checker via CLI:
+    - Added `mcp-agent-mail guard check` command that reads NUL-delimited paths (`--stdin-nul`) and checks conflicts using Git wildmatch semantics (via `pathspec`), honoring `core.ignorecase`.
+    - Hook plugins now delegate to the CLI via `uv run python -m mcp_agent_mail.cli guard check --stdin-nul --repo <root>` so server/CLI/hook semantics cannot drift. Fallback to `python -m mcp_agent_mail.cli ...` when `uv` is unavailable.
+    - Advisory mode (`AGENT_MAIL_GUARD_MODE=warn` or `--advisory`) prints conflicts but does not block.
+    - Windows: `.cmd` and `.ps1` shims for chain-runner are installed to mirror POSIX behavior.
   - 2025-11-10: Project maintenance CLI:
     - Added `mcp-agent-mail projects adopt <from> <to> --dry-run` that validates same repo (`git-common-dir`) and prints a consolidation plan. (Apply phase to be implemented in a later step.)
   - 2025-11-10: Guard status and adopt apply:
@@ -149,12 +160,16 @@ Implementation progress:
   - Backfill existing rows with generated UUIDs.
   - Look up by `project_uid` first, then by slug.
 
-### Canonicalization order (robust & private; applied only when `WORKTREES_ENABLED=1`)
+### Canonicalization order (robust & private; applied only when `WORKTREES_ENABLED`/`GIT_IDENTITY_ENABLED` is on)
 
-1. If marker present: `project_uid = read_marker()`.
-2. Else if `PROJECT_IDENTITY_MODE=git-remote` (or remote source is enabled) **and** a normalized remote URL can be derived (default remote: `origin` or `PROJECT_IDENTITY_REMOTE`): unify by remote; generate `project_uid` and persist the private marker for stability across machines.
-3. Else if `PROJECT_IDENTITY_MODE in {git-common-dir, git-toplevel}`: compute privacy‑safe slug from canonical Git paths and generate `project_uid`.
-4. Else: `dir` mode for slug (back‑compat), but still generate `project_uid` so you can adopt later.
+1. If committed marker present: `project_uid = read_marker()`.
+2. Else if discovery YAML `.agent-mail.yaml` contains `project_uid:`: use it.
+3. Else if `PROJECT_IDENTITY_MODE=git-remote` (or remote source is enabled) **and** a normalized remote URL can be derived (default remote: `origin` or `PROJECT_IDENTITY_REMOTE`): unify by remote; generate `project_uid` and persist the private marker for stability across machines.
+4. Else if `PROJECT_IDENTITY_MODE in {git-common-dir, git-toplevel}`: compute privacy‑safe slug from canonical Git paths and generate `project_uid`.
+5. Else: `dir` mode for slug (back‑compat), but still generate `project_uid` so you can adopt later.
+- ### Migration tools
+  - `mcp-agent-mail projects mark-identity [--no-commit]` writes `.agent-mail-project-id` with the current `project_uid` and optionally commits it.
+  - `mcp-agent-mail projects discovery-init [--product <uid>]` scaffolds `.agent-mail.yaml` with `project_uid:` (and optional `product_uid:`) for discovery/overrides.
 
 ### Drop‑in function (replacement for canonicalizer; now supports `git-remote`)
 
@@ -521,7 +536,7 @@ Handle:
 ## 9) Surfaces & APIs (additive, low risk)
 
 - Tools: keep existing signatures; add `project_uid` in responses.
-- New resource: `resource://identity?project=<abs-path>` returns:
+- New resource (gated by `WORKTREES_ENABLED=1`): `resource://identity?project=<abs-path>` returns:
 
 ```json
 {
@@ -1212,7 +1227,7 @@ git rev-parse --show-prefix      # get current subdir (for path normalization)
 Per-worktree environment via direnv (`.envrc`):
 
 ```bash
-export AGENT_NAME="AliceDev"
+export AGENT_NAME="PurpleLake"  # Valid adjective+noun format
 # Optional client-side hint if needed later
 export AGENT_MAIL_PROJECT_IDENTITY_MODE="git-common-dir"
 ```
@@ -1317,23 +1332,39 @@ File reservation best practices:
 - [x] Implement repo-root relative Git pathspec matching with normalization (fallback if missing dependency).
 - [x] Add rename/move detection in guard path collection.
 - [x] Add `AGENT_MAIL_BYPASS=1` emergency bypass mechanism.
-- [ ] Implement rich-styled, actionable error messages in guards.
+- [x] Implement rich-styled, actionable error messages in guards.
+  - DONE: pre-commit and pre-push hooks now print conflict summaries and hints for `AGENT_MAIL_GUARD_MODE=warn` and `AGENT_MAIL_BYPASS=1`; fixed small NUL-safety bug in pre-push collector (changed list population).
 - [x] Add branch/worktree context to reservation metadata.
 - [x] Add server-side validation warning for overly broad reservation patterns.
 - [x] Implement `guard status` subcommand.
 - [x] Add `mail status` subcommand and `resource://identity?project=<path>` transparency resource.
 - [x] Implement `projects adopt` CLI (dry‑run/apply) and write `aliases.json`.
-- [ ] Implement Product Bus: `ensure_product`, `products.link`, and product‑wide resources.
+- [x] Implement Product Bus: `ensure_product`, `products_link`, and product‑wide resources.
+  - DONE: Added models (`Product`, `ProductProjectLink`), tools (`ensure_product`, `products_link`), product resource (`resource://product/{key}`), and product-wide search (`search_messages_product`). Tests included.
+- [x] Add product‑wide inbox fetch and summarization helpers.
+  - DONE: Server tools `fetch_inbox_product`, `summarize_thread_product` aggregate across linked projects with optional LLM refinement. CLI commands added: `products inbox`, `products summarize-thread`.
+  - DONE: README and AGENTS updated with examples for product-wide inbox and summarization usage.
 - [x] Ship `am-run` and `amctl env` with build slots + per‑agent caches.
   - DONE: `am-run` now auto‑acquires/renews/releases advisory build slots (warn mode prints conflicts), and exports `CACHE_KEY`/`ARTIFACT_DIR` via `amctl env`.
 - [x] Update docs (`AGENTS.md`, `README.md`) with worktree guides and edge cases.
   - DONE: Added worktree recipes, guard usage, and build slots sections with examples.
-- [ ] Change all "uv/pip" references to "uv only".
-- [ ] Add unit tests for canonicalizer (all edge cases).
-- [ ] Add unit tests for guard path resolution and matching.
-- [ ] Add integration tests for worktrees (shared project, cross-worktree conflicts).
-- [ ] Test on case-insensitive filesystems.
-- [ ] Test WSL2 path normalization.
-- [ ] Test rename/move detection.
-- [ ] Test bypass mechanism.
-- [ ] Optional: publish container recipes; CI template that runs `am-run`.
+- [x] Change all "uv/pip" references to "uv only".
+  - DONE: Owned docs (`README.md`, `AGENTS.md`, plan) contain uv‑only guidance; any remaining `pip` mentions are in third‑party docs retained verbatim.
+- [x] Add unit tests for canonicalizer (all edge cases).
+  - DONE: added tests for dir-mode fallback, git-common-dir, committed/private marker precedence, and remote fingerprint fallback.
+- [x] Add unit tests for guard path resolution and matching.
+  - DONE: pre-commit rename detection; pre-push range collection conflicts with real tuple input.
+- [x] Add integration tests for worktrees (shared project, cross-worktree conflicts).
+  - DONE: worktree identity returns same slug/project_uid; cross-worktree pre-commit conflict blocks.
+- [x] Test on case-insensitive filesystems.
+  - PARTIAL DONE: unit test validates `core.ignorecase` detection via git config. CI FS matrix still pending.
+- [x] Test WSL2 path normalization.
+  - DONE: added skip-if-not-WSL2 test to assert POSIX canonical paths under `_resolve_project_identity`.
+- [x] Test rename/move detection.
+  - DONE: staged rename collected (old+new) triggers conflicts on new path.
+- [x] Test bypass mechanism.
+  - DONE: AGENT_MAIL_BYPASS=1 exits 0 despite conflicts.
+- [x] Optional: CI template that runs `am-run`.
+  - DONE: GitHub Actions workflow added (Ubuntu, macOS): runs lint, type-check, tests, and a smoke `am-run` on Ubuntu.
+- [x] Optional: publish container recipes.
+  - DONE: Added `Dockerfile` (Python 3.14 + uv + git) and `compose.yaml` (port 8765, volume for storage, optional `.env` mount). README includes usage instructions.

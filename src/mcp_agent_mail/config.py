@@ -7,10 +7,15 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Final
 
-from decouple import Config as DecoupleConfig, RepositoryEnv
+from decouple import Config as DecoupleConfig, RepositoryEmpty, RepositoryEnv  # type: ignore[attr-defined]
 
 _DOTENV_PATH: Final[Path] = Path(".env")
-_decouple_config: Final[DecoupleConfig] = DecoupleConfig(RepositoryEnv(str(_DOTENV_PATH)))
+# Gracefully handle missing .env (e.g., in CI/tests) by falling back to an empty repository
+try:
+    _decouple_config: Final[DecoupleConfig] = DecoupleConfig(RepositoryEnv(str(_DOTENV_PATH)))
+except FileNotFoundError:
+    # Fall back to an empty repository (reads only os.environ; all .env lookups use defaults)
+    _decouple_config = DecoupleConfig(RepositoryEmpty())  # type: ignore[arg-type]
 
 
 @dataclass(slots=True, frozen=True)
@@ -275,7 +280,11 @@ def get_settings() -> Settings:
 
     return Settings(
         environment=environment,
-        worktrees_enabled=_bool(_decouple_config("WORKTREES_ENABLED", default="false"), default=False),
+        # Gate: allow either legacy WORKTREES_ENABLED or new GIT_IDENTITY_ENABLED to enable features
+        worktrees_enabled=(
+            _bool(_decouple_config("WORKTREES_ENABLED", default="false"), default=False)
+            or _bool(_decouple_config("GIT_IDENTITY_ENABLED", default="false"), default=False)
+        ),
         project_identity_mode=_decouple_config("PROJECT_IDENTITY_MODE", default="dir").strip().lower(),
         project_identity_remote=_decouple_config("PROJECT_IDENTITY_REMOTE", default="origin").strip(),
         http=http_settings,

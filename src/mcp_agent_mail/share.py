@@ -178,12 +178,33 @@ SCRUB_PRESETS: dict[str, dict[str, Any]] = {
         "redact_body": False,
         "body_placeholder": None,
         "drop_attachments": False,
+        "scrub_secrets": True,
+        "clear_ack_state": True,
+        "clear_recipients": True,
+        "clear_file_reservations": True,
+        "clear_agent_links": True,
     },
     "strict": {
         "description": "High-scrub: replace message bodies with placeholders and omit all attachments from the snapshot.",
         "redact_body": True,
         "body_placeholder": "[Message body redacted]",
         "drop_attachments": True,
+        "scrub_secrets": True,
+        "clear_ack_state": True,
+        "clear_recipients": True,
+        "clear_file_reservations": True,
+        "clear_agent_links": True,
+    },
+    "archive": {
+        "description": "Lossless snapshot for disaster recovery: preserve ack/read state, recipients, attachments, and body content while still running the standard cleanup pipeline.",
+        "redact_body": False,
+        "body_placeholder": None,
+        "drop_attachments": False,
+        "scrub_secrets": False,
+        "clear_ack_state": False,
+        "clear_recipients": False,
+        "clear_file_reservations": False,
+        "clear_agent_links": False,
     },
 }
 
@@ -797,6 +818,11 @@ def scrub_snapshot(
 
     preset_key = _normalize_scrub_preset(preset)
     preset_opts = SCRUB_PRESETS[preset_key]
+    clear_ack_state = bool(preset_opts.get("clear_ack_state", True))
+    clear_recipients = bool(preset_opts.get("clear_recipients", True))
+    clear_file_reservations = bool(preset_opts.get("clear_file_reservations", True))
+    clear_agent_links = bool(preset_opts.get("clear_agent_links", True))
+    scrub_secrets = bool(preset_opts.get("scrub_secrets", True))
 
     bodies_redacted = 0
     attachments_cleared = 0
@@ -806,29 +832,52 @@ def scrub_snapshot(
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys=ON")
 
-        # Agent names (BlueMountain, GreenCastle, etc.) are already meaningless pseudonyms by design
-        # No need to further pseudonymize them
+        # Agent names are already meaningless pseudonyms in our system.
+        # Do not rewrite or scrub agent names.
         agents_total = conn.execute("SELECT COUNT(*) FROM agents").fetchone()[0]
+        agents_pseudonymized = 0
 
-        ack_cursor = conn.execute("UPDATE messages SET ack_required = 0")
-        ack_flags_cleared = ack_cursor.rowcount or 0
+        if clear_ack_state:
+            ack_cursor = conn.execute("UPDATE messages SET ack_required = 0")
+            ack_flags_cleared = ack_cursor.rowcount or 0
+        else:
+            ack_flags_cleared = 0
 
-        recipients_cursor = conn.execute("UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL")
-        recipients_cleared = recipients_cursor.rowcount or 0
+        if clear_recipients:
+            recipients_cursor = conn.execute(
+                "UPDATE message_recipients SET read_ts = NULL, ack_ts = NULL"
+            )
+            recipients_cleared = recipients_cursor.rowcount or 0
+        else:
+            recipients_cleared = 0
 
-        file_res_cursor = conn.execute("DELETE FROM file_reservations")
-        file_res_removed = file_res_cursor.rowcount or 0
+        if clear_file_reservations:
+            file_res_cursor = conn.execute("DELETE FROM file_reservations")
+            file_res_removed = file_res_cursor.rowcount or 0
+        else:
+            file_res_removed = 0
 
-        agent_links_cursor = conn.execute("DELETE FROM agent_links")
-        agent_links_removed = agent_links_cursor.rowcount or 0
+        if clear_agent_links:
+            agent_links_cursor = conn.execute("DELETE FROM agent_links")
+            agent_links_removed = agent_links_cursor.rowcount or 0
+        else:
+            agent_links_removed = 0
 
         secrets_replaced = 0
         attachments_sanitized = 0
 
         message_rows = conn.execute("SELECT id, subject, body_md, attachments FROM messages").fetchall()
         for msg in message_rows:
-            subject, subj_replacements = _scrub_text(msg["subject"])
-            body, body_replacements = _scrub_text(msg["body_md"])
+            subject_original = msg["subject"] or ""
+            body_original = msg["body_md"] or ""
+            if scrub_secrets:
+                subject, subj_replacements = _scrub_text(subject_original)
+                body, body_replacements = _scrub_text(body_original)
+            else:
+                subject = subject_original
+                body = body_original
+                subj_replacements = 0
+                body_replacements = 0
             secrets_replaced += subj_replacements + body_replacements
             attachments_value = msg["attachments"]
             attachments_updated = False
@@ -842,22 +891,25 @@ def scrub_snapshot(
                         attachments_data = attachments_value
                 else:
                     attachments_data = attachments_value
-                if preset_opts["drop_attachments"] and attachments_data:
-                    attachments_data = []
-                    attachments_cleared += 1
-                    attachments_updated = True
+            else:
+                attachments_data = []
+            if preset_opts["drop_attachments"] and attachments_data:
+                attachments_data = []
+                attachments_cleared += 1
+                attachments_updated = True
+            if scrub_secrets and attachments_data:
                 sanitized, rep_count, removed_count = _scrub_structure(attachments_data)
                 attachment_replacements += rep_count
                 attachment_keys_removed += removed_count
                 if sanitized != attachments_data:
                     attachments_data = sanitized
                     attachments_updated = True
-                if attachments_updated:
-                    sanitized_json = json.dumps(attachments_data, separators=(",", ":"), sort_keys=True)
-                    conn.execute(
-                        "UPDATE messages SET attachments = ? WHERE id = ?",
-                        (sanitized_json, msg["id"]),
-                    )
+            if attachments_updated:
+                sanitized_json = json.dumps(attachments_data, separators=(",", ":"), sort_keys=True)
+                conn.execute(
+                    "UPDATE messages SET attachments = ? WHERE id = ?",
+                    (sanitized_json, msg["id"]),
+                )
             if subject != msg["subject"]:
                 conn.execute("UPDATE messages SET subject = ? WHERE id = ?", (subject, msg["id"]))
             if preset_opts["redact_body"]:
@@ -877,9 +929,9 @@ def scrub_snapshot(
 
     return ScrubSummary(
         preset=preset_key,
-        pseudonym_salt="",  # No longer used - agent names already meaningless
+        pseudonym_salt=preset_key,
         agents_total=agents_total,
-        agents_pseudonymized=0,  # No longer pseudonymizing - agent names already meaningless
+        agents_pseudonymized=int(agents_pseudonymized),
         ack_flags_cleared=ack_flags_cleared,
         recipients_cleared=recipients_cleared,
         file_reservations_removed=file_res_removed,
@@ -909,24 +961,44 @@ def build_search_indexes(snapshot_path: Path) -> bool:
             """
         )
         conn.execute("DELETE FROM fts_messages")
-        conn.execute(
-            """
-            INSERT INTO fts_messages(rowid, subject, body, importance, project_slug, thread_key, created_ts)
-            SELECT
-                m.id,
-                COALESCE(m.subject, ''),
-                COALESCE(m.body_md, ''),
-                COALESCE(m.importance, ''),
-                COALESCE(p.slug, ''),
-                CASE
-                    WHEN m.thread_id IS NULL OR m.thread_id = '' THEN printf('msg:%d', m.id)
-                    ELSE m.thread_id
-                END,
-                COALESCE(m.created_ts, '')
-            FROM messages AS m
-            LEFT JOIN projects AS p ON p.id = m.project_id
-            """
-        )
+        # Detect presence of thread_id column to avoid compile-time failures on older snapshots
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        has_thread_id = "thread_id" in {c.lower() for c in cols}
+        if has_thread_id:
+            conn.execute(
+                """
+                INSERT INTO fts_messages(rowid, subject, body, importance, project_slug, thread_key, created_ts)
+                SELECT
+                    m.id,
+                    COALESCE(m.subject, ''),
+                    COALESCE(m.body_md, ''),
+                    COALESCE(m.importance, ''),
+                    COALESCE(p.slug, ''),
+                    CASE
+                        WHEN m.thread_id IS NULL OR m.thread_id = '' THEN printf('msg:%d', m.id)
+                        ELSE m.thread_id
+                    END,
+                    COALESCE(m.created_ts, '')
+                FROM messages AS m
+                LEFT JOIN projects AS p ON p.id = m.project_id
+                """
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO fts_messages(rowid, subject, body, importance, project_slug, thread_key, created_ts)
+                SELECT
+                    m.id,
+                    COALESCE(m.subject, ''),
+                    COALESCE(m.body_md, ''),
+                    COALESCE(m.importance, ''),
+                    COALESCE(p.slug, ''),
+                    printf('msg:%d', m.id),
+                    COALESCE(m.created_ts, '')
+                FROM messages AS m
+                LEFT JOIN projects AS p ON p.id = m.project_id
+                """
+            )
         conn.execute("INSERT INTO fts_messages(fts_messages) VALUES('optimize')")
         conn.commit()
         return True
@@ -980,70 +1052,147 @@ def build_materialized_views(snapshot_path: Path) -> None:
     """
     conn = sqlite3.connect(str(snapshot_path))
     try:
+        # Ensure recipients table exists to satisfy LEFT JOIN in the view creation
+        conn.execute("CREATE TABLE IF NOT EXISTS message_recipients (message_id INTEGER, agent_id INTEGER)")
         # Message overview materialized view
         # Denormalizes messages with sender names for efficient list rendering
-        conn.executescript(
-            """
-            DROP TABLE IF EXISTS message_overview_mv;
-            CREATE TABLE message_overview_mv AS
-            SELECT
-                m.id,
-                m.project_id,
-                m.thread_id,
-                m.subject,
-                m.importance,
-                m.ack_required,
-                m.created_ts,
-                a.name AS sender_name,
-                LENGTH(m.body_md) AS body_length,
-                json_array_length(m.attachments) AS attachment_count,
-                SUBSTR(COALESCE(m.body_md, ''), 1, 280) AS latest_snippet,
-                COALESCE(r.recipients, '') AS recipients
-            FROM messages m
-            JOIN agents a ON m.sender_id = a.id
-            LEFT JOIN (
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        colset = {c.lower() for c in cols}
+        has_thread_id = "thread_id" in colset
+        has_sender_id = "sender_id" in colset
+        if has_thread_id:
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS message_overview_mv;
+                CREATE TABLE message_overview_mv AS
                 SELECT
-                    mr.message_id,
-                    GROUP_CONCAT(COALESCE(ag.name, ''), ', ') AS recipients
-                FROM message_recipients mr
-                LEFT JOIN agents ag ON ag.id = mr.agent_id
-                GROUP BY mr.message_id
-            ) r ON r.message_id = m.id
-            ORDER BY m.created_ts DESC;
+                    m.id,
+                    m.project_id,
+                    m.thread_id,
+                    m.subject,
+                    m.importance,
+                    m.ack_required,
+                    m.created_ts,
+                    {sender_expr} AS sender_name,
+                    LENGTH(m.body_md) AS body_length,
+                    json_array_length(m.attachments) AS attachment_count,
+                    SUBSTR(COALESCE(m.body_md, ''), 1, 280) AS latest_snippet,
+                    COALESCE(r.recipients, '') AS recipients
+                FROM messages m
+                {sender_join}
+                LEFT JOIN (
+                    SELECT
+                        mr.message_id,
+                        GROUP_CONCAT(COALESCE(ag.name, ''), ', ') AS recipients
+                    FROM message_recipients mr
+                    LEFT JOIN agents ag ON ag.id = mr.agent_id
+                    GROUP BY mr.message_id
+                ) r ON r.message_id = m.id
+                ORDER BY m.created_ts DESC;
 
-            -- Covering indexes for common query patterns
-            CREATE INDEX idx_msg_overview_created ON message_overview_mv(created_ts DESC);
-            CREATE INDEX idx_msg_overview_thread ON message_overview_mv(thread_id, created_ts DESC);
-            CREATE INDEX idx_msg_overview_project ON message_overview_mv(project_id, created_ts DESC);
-            CREATE INDEX idx_msg_overview_importance ON message_overview_mv(importance, created_ts DESC);
-            """
-        )
+                -- Covering indexes for common query patterns
+                CREATE INDEX idx_msg_overview_created ON message_overview_mv(created_ts DESC);
+                CREATE INDEX idx_msg_overview_thread ON message_overview_mv(thread_id, created_ts DESC);
+                CREATE INDEX idx_msg_overview_project ON message_overview_mv(project_id, created_ts DESC);
+                CREATE INDEX idx_msg_overview_importance ON message_overview_mv(importance, created_ts DESC);
+                """
+                .format(
+                    sender_expr=("a.name" if has_sender_id else "''"),
+                    sender_join=("JOIN agents a ON m.sender_id = a.id" if has_sender_id else ""),
+                )
+            )
+        else:
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS message_overview_mv;
+                CREATE TABLE message_overview_mv AS
+                SELECT
+                    m.id,
+                    m.project_id,
+                    printf('msg:%d', m.id) AS thread_id,
+                    m.subject,
+                    m.importance,
+                    m.ack_required,
+                    m.created_ts,
+                    {sender_expr} AS sender_name,
+                    LENGTH(m.body_md) AS body_length,
+                    json_array_length(m.attachments) AS attachment_count,
+                    SUBSTR(COALESCE(m.body_md, ''), 1, 280) AS latest_snippet,
+                    COALESCE(r.recipients, '') AS recipients
+                FROM messages m
+                {sender_join}
+                LEFT JOIN (
+                    SELECT
+                        mr.message_id,
+                        GROUP_CONCAT(COALESCE(ag.name, ''), ', ') AS recipients
+                    FROM message_recipients mr
+                    LEFT JOIN agents ag ON ag.id = mr.agent_id
+                    GROUP BY mr.message_id
+                ) r ON r.message_id = m.id
+                ORDER BY m.created_ts DESC;
+
+                -- Covering indexes for common query patterns
+                CREATE INDEX idx_msg_overview_created ON message_overview_mv(created_ts DESC);
+                CREATE INDEX idx_msg_overview_thread ON message_overview_mv(thread_id, created_ts DESC);
+                CREATE INDEX idx_msg_overview_project ON message_overview_mv(project_id, created_ts DESC);
+                CREATE INDEX idx_msg_overview_importance ON message_overview_mv(importance, created_ts DESC);
+                """
+                .format(
+                    sender_expr=("a.name" if has_sender_id else "''"),
+                    sender_join=("JOIN agents a ON m.sender_id = a.id" if has_sender_id else ""),
+                )
+            )
 
         # Attachments by message materialized view
         # Flattens JSON attachments array for easier filtering and counting
-        conn.executescript(
-            """
-            DROP TABLE IF EXISTS attachments_by_message_mv;
-            CREATE TABLE attachments_by_message_mv AS
-            SELECT
-                m.id AS message_id,
-                m.project_id,
-                m.thread_id,
-                m.created_ts,
-                json_extract(value, '$.type') AS attachment_type,
-                json_extract(value, '$.media_type') AS media_type,
-                json_extract(value, '$.path') AS path,
-                CAST(json_extract(value, '$.size_bytes') AS INTEGER) AS size_bytes
-            FROM messages m,
-                 json_each(m.attachments)
-            WHERE m.attachments != '[]';
+        if has_thread_id:
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS attachments_by_message_mv;
+                CREATE TABLE attachments_by_message_mv AS
+                SELECT
+                    m.id AS message_id,
+                    m.project_id,
+                    m.thread_id,
+                    m.created_ts,
+                    json_extract(value, '$.type') AS attachment_type,
+                    json_extract(value, '$.media_type') AS media_type,
+                    json_extract(value, '$.path') AS path,
+                    CAST(json_extract(value, '$.size_bytes') AS INTEGER) AS size_bytes
+                FROM messages m,
+                     json_each(m.attachments)
+                WHERE m.attachments != '[]';
 
-            -- Indexes for attachment queries
-            CREATE INDEX idx_attach_by_msg ON attachments_by_message_mv(message_id);
-            CREATE INDEX idx_attach_by_type ON attachments_by_message_mv(attachment_type, created_ts DESC);
-            CREATE INDEX idx_attach_by_project ON attachments_by_message_mv(project_id, created_ts DESC);
-            """
-        )
+                -- Indexes for attachment queries
+                CREATE INDEX idx_attach_by_msg ON attachments_by_message_mv(message_id);
+                CREATE INDEX idx_attach_by_type ON attachments_by_message_mv(attachment_type, created_ts DESC);
+                CREATE INDEX idx_attach_by_project ON attachments_by_message_mv(project_id, created_ts DESC);
+                """
+            )
+        else:
+            conn.executescript(
+                """
+                DROP TABLE IF EXISTS attachments_by_message_mv;
+                CREATE TABLE attachments_by_message_mv AS
+                SELECT
+                    m.id AS message_id,
+                    m.project_id,
+                    NULL AS thread_id,
+                    m.created_ts,
+                    json_extract(value, '$.type') AS attachment_type,
+                    json_extract(value, '$.media_type') AS media_type,
+                    json_extract(value, '$.path') AS path,
+                    CAST(json_extract(value, '$.size_bytes') AS INTEGER) AS size_bytes
+                FROM messages m,
+                     json_each(m.attachments)
+                WHERE m.attachments != '[]';
+
+                -- Indexes for attachment queries
+                CREATE INDEX idx_attach_by_msg ON attachments_by_message_mv(message_id);
+                CREATE INDEX idx_attach_by_type ON attachments_by_message_mv(attachment_type, created_ts DESC);
+                CREATE INDEX idx_attach_by_project ON attachments_by_message_mv(project_id, created_ts DESC);
+                """
+            )
 
         # FTS search overview materialized view
         # Pre-computes search result snippets and highlights for efficient rendering
@@ -1090,30 +1239,37 @@ def create_performance_indexes(snapshot_path: Path) -> None:
             with suppress(sqlite3.OperationalError):
                 conn.execute(f"ALTER TABLE messages ADD COLUMN {column} TEXT")
 
-        conn.execute(
-            """
-            UPDATE messages
-            SET
-                subject_lower = LOWER(COALESCE(subject, '')),
-                sender_lower = LOWER(
-                    COALESCE(
-                        (SELECT name FROM agents WHERE agents.id = messages.sender_id),
-                        ''
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(messages)").fetchall()]
+        colset = {c.lower() for c in cols}
+        has_sender_id = "sender_id" in colset
+        if has_sender_id:
+            conn.execute(
+                """
+                UPDATE messages
+                SET
+                    subject_lower = LOWER(COALESCE(subject, '')),
+                    sender_lower = LOWER(
+                        COALESCE(
+                            (SELECT name FROM agents WHERE agents.id = messages.sender_id),
+                            ''
+                        )
                     )
-                )
-            """
-        )
+                """
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE messages
+                SET
+                    subject_lower = LOWER(COALESCE(subject, '')),
+                    sender_lower = ''
+                """
+            )
 
         conn.executescript(
             """
             CREATE INDEX IF NOT EXISTS idx_messages_created_ts
               ON messages(created_ts DESC);
-
-            CREATE INDEX IF NOT EXISTS idx_messages_thread
-              ON messages(thread_id, created_ts DESC);
-
-            CREATE INDEX IF NOT EXISTS idx_messages_sender
-              ON messages(sender_id, created_ts DESC);
 
             CREATE INDEX IF NOT EXISTS idx_messages_subject_lower
               ON messages(subject_lower);
@@ -1122,6 +1278,12 @@ def create_performance_indexes(snapshot_path: Path) -> None:
               ON messages(sender_lower);
             """
         )
+        # Conditional indexes for optional columns
+        with suppress(sqlite3.OperationalError):
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id, created_ts DESC)")
+        # thread_id index if column exists
+        with suppress(sqlite3.OperationalError):
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, created_ts DESC)")
 
         conn.commit()
     finally:
@@ -1876,7 +2038,7 @@ def write_bundle_scaffolding(
         "",
     ]
     if hosting_hints:
-        readme_lines.append("Detected hosting signals when this export was generated:")
+        readme_lines.append("Detected hosting targets:")
         for hint in hosting_hints:
             signals_text = "; ".join(hint.signals)
             readme_lines.append(f"- **{hint.title}** — {hint.summary} _(signals: {signals_text})_")

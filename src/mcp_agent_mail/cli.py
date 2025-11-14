@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.metadata as importlib_metadata
 import json
 import os
 import shutil
@@ -15,18 +16,20 @@ import threading
 import time
 import warnings
 import webbrowser
-from contextlib import suppress
-from dataclasses import dataclass
+from contextlib import nullcontext, suppress
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Annotated, Any, Optional, cast
+from typing import Annotated, Any, Optional, Sequence, cast
+from zipfile import ZIP_DEFLATED, ZipFile
 
+import httpx
 import typer
 import uvicorn
 from rich.console import Console
 from rich.table import Table
-from sqlalchemy import asc, desc, func, select
+from sqlalchemy import asc, bindparam, desc, func, select, text
 from sqlalchemy.engine import make_url
 
 from .app import build_mcp_server
@@ -34,7 +37,7 @@ from .config import get_settings
 from .db import ensure_schema, get_session
 from .guard import install_guard as install_guard_script, uninstall_guard as uninstall_guard_script
 from .http import build_http_app
-from .models import Agent, FileReservation, Message, MessageRecipient, Project
+from .models import Agent, FileReservation, Message, MessageRecipient, Product, ProductProjectLink, Project
 from .share import (
     DEFAULT_CHUNK_SIZE,
     DEFAULT_CHUNK_THRESHOLD,
@@ -61,6 +64,11 @@ warnings.filterwarnings("ignore", category=UserWarning, module="bleach")
 
 console = Console()
 DEFAULT_ENV_PATH = Path(".env")
+ARCHIVE_DIR_NAME = "archived_mailbox_states"
+ARCHIVE_METADATA_FILENAME = "metadata.json"
+ARCHIVE_SNAPSHOT_RELATIVE = Path("snapshot") / "mailbox.sqlite3"
+ARCHIVE_STORAGE_DIRNAME = Path("storage_repo")
+DEFAULT_ARCHIVE_SCRUB_PRESET = "archive"
 app = typer.Typer(help="Developer utilities for the MCP Agent Mail service.")
 
 _PREVIEW_FORCE_TOKEN = 0
@@ -71,18 +79,22 @@ file_reservations_app = typer.Typer(help="Inspect advisory file_reservations")
 acks_app = typer.Typer(help="Review acknowledgement status")
 share_app = typer.Typer(help="Export MCP Agent Mail data for static sharing")
 config_app = typer.Typer(help="Configure server settings")
+archive_app = typer.Typer(help="Archive and restore local mailbox states (lossless disaster-recovery bundles)")
 
 app.add_typer(guard_app, name="guard")
 app.add_typer(file_reservations_app, name="file_reservations")
 app.add_typer(acks_app, name="acks")
 app.add_typer(share_app, name="share")
 app.add_typer(config_app, name="config")
+app.add_typer(archive_app, name="archive")
 mail_app = typer.Typer(help="Mail diagnostics and routing status")
 app.add_typer(mail_app, name="mail")
 projects_app = typer.Typer(help="Project maintenance utilities")
 app.add_typer(projects_app, name="projects")
 amctl_app = typer.Typer(help="Build and environment helpers")
 app.add_typer(amctl_app, name="amctl")
+products_app = typer.Typer(help="Product Bus: manage products and links")
+app.add_typer(products_app, name="products")
 
 
 async def _get_project_record(identifier: str) -> Project:
@@ -115,6 +127,421 @@ def _iso(dt: Optional[datetime]) -> str:
     if dt is None:
         return ""
     return dt.astimezone(timezone.utc).isoformat()
+
+
+@products_app.command("ensure")
+def products_ensure(
+    product_key: Annotated[Optional[str], typer.Argument(help="Product uid or name")] = None,
+    name: Annotated[Optional[str], typer.Option("--name", "-n", help="Product display name")] = None,
+) -> None:
+    """
+    Ensure a product exists (creates if missing) and print its identifiers.
+    """
+    key = (product_key or name or "").strip()
+    if not key:
+        raise typer.BadParameter("Provide a product_key or --name.")
+    # Prefer server tool to ensure consistent uid policy
+    settings = get_settings()
+    server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
+    bearer = settings.http.bearer_token or os.environ.get("HTTP_BEARER_TOKEN", "")
+    resp_data: dict[str, Any] = {}
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            headers = {}
+            if bearer:
+                headers["Authorization"] = f"Bearer {bearer}"
+            arguments: dict[str, Any] = {}
+            if product_key:
+                arguments["product_key"] = product_key
+            if name:
+                arguments["name"] = name
+            req = {
+                "jsonrpc": "2.0",
+                "id": "cli-products-ensure",
+                "method": "tools/call",
+                "params": {
+                    "name": "ensure_product",
+                    "arguments": arguments,
+                },
+            }
+            resp = client.post(server_url, json=req, headers=headers)
+            data = resp.json()
+            result = (data or {}).get("result") or {}
+            if result:
+                resp_data = result
+    except Exception:
+        resp_data = {}
+    if not resp_data:
+        # Fallback to local DB with the same strict uid policy
+        async def _ensure_local() -> dict[str, Any]:
+            await ensure_schema()
+            async with get_session() as session:
+                existing = await session.execute(
+                    select(Product).where((Product.product_uid == key) | (Product.name == key))
+                )
+                prod = existing.scalars().first()
+                if prod:
+                    return {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name, "created_at": prod.created_at}
+                import re as _re
+                import uuid as _uuid
+                uid_pattern = _re.compile(r"^[A-Fa-f0-9]{8,64}$")
+                if product_key and uid_pattern.fullmatch(product_key.strip()):
+                    uid = product_key.strip().lower()
+                else:
+                    uid = _uuid.uuid4().hex[:20]
+                display_name = (name or key).strip()
+                display_name = " ".join(display_name.split())[:255] or uid
+                prod = Product(product_uid=uid, name=display_name)
+                session.add(prod)
+                await session.commit()
+                await session.refresh(prod)
+                return {"id": prod.id, "product_uid": prod.product_uid, "name": prod.name, "created_at": prod.created_at}
+        resp_data = asyncio.run(_ensure_local())
+    table = Table(title="Product", show_lines=False)
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("id", str(resp_data.get("id", "")))
+    table.add_row("product_uid", str(resp_data.get("product_uid", "")))
+    table.add_row("name", str(resp_data.get("name", "")))
+    _created = resp_data.get("created_at", "")
+    try:
+        if hasattr(_created, "isoformat"):
+            _created = _created.isoformat()
+    except Exception:
+        pass
+    table.add_row("created_at", str(_created))
+    console.print(table)
+
+
+@products_app.command("link")
+def products_link(
+    product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
+    project: Annotated[str, typer.Argument(..., help="Project slug or path")],
+) -> None:
+    """
+    Link a project into a product (idempotent).
+    """
+    async def _link() -> dict:
+        await ensure_schema()
+        prod = await _get_product_record(product_key.strip())
+        proj = await _get_project_record(project)
+        async with get_session() as session:
+            existing = await session.execute(
+                select(ProductProjectLink).where(
+                    ProductProjectLink.product_id == prod.id, ProductProjectLink.project_id == proj.id
+                )
+            )
+            link = existing.scalars().first()
+            if link is None:
+                link = ProductProjectLink(product_id=int(prod.id), project_id=int(proj.id))
+                session.add(link)
+                await session.commit()
+                await session.refresh(link)
+        return {"product_uid": prod.product_uid, "product_name": prod.name, "project_slug": proj.slug}
+    res = asyncio.run(_link())
+    console.print(f"[green]Linked[/] project '{res['project_slug']}' into product '{res['product_name']}' ({res['product_uid']}).")
+
+
+@products_app.command("status")
+def products_status(
+    product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
+) -> None:
+    """
+    Show product metadata and linked projects.
+    """
+    async def _status() -> tuple[Product, list[Project]]:
+        await ensure_schema()
+        async with get_session() as session:
+            stmt_prod = select(Product).where((Product.product_uid == product_key) | (Product.name == product_key))
+            prod = (await session.execute(stmt_prod)).scalars().first()
+            if prod is None:
+                raise typer.BadParameter(f"Product '{product_key}' not found.")
+            rows = await session.execute(
+                select(Project).join(ProductProjectLink, ProductProjectLink.project_id == Project.id).where(
+                    ProductProjectLink.product_id == prod.id
+                )
+            )
+            projects = list(rows.scalars().all())
+            return prod, projects
+    prod, projects = asyncio.run(_status())
+    table = Table(title=f"Product: {prod.name}", show_lines=False)
+    table.add_column("Field")
+    table.add_column("Value")
+    table.add_row("id", str(prod.id))
+    table.add_row("product_uid", prod.product_uid)
+    table.add_row("name", prod.name)
+    table.add_row("created_at", _iso(prod.created_at))
+    console.print(table)
+    pt = Table(title="Linked Projects", show_lines=False)
+    pt.add_column("id")
+    pt.add_column("slug")
+    pt.add_column("human_key")
+    for p in projects:
+        pt.add_row(str(p.id), p.slug, p.human_key)
+    console.print(pt)
+
+
+@products_app.command("search")
+def products_search(
+    product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
+    query: Annotated[str, typer.Argument(..., help="FTS query")],
+    limit: Annotated[int, typer.Option("--limit", "-l", help="Max results",)] = 20,
+) -> None:
+    """
+    Full-text search over messages for all projects linked to a product.
+    """
+    async def _run() -> list[dict]:
+        await ensure_schema()
+        async with get_session() as session:
+            stmt_prod = select(Product).where((Product.product_uid == product_key) | (Product.name == product_key))
+            prod = (await session.execute(stmt_prod)).scalars().first()
+            if prod is None:
+                raise typer.BadParameter(f"Product '{product_key}' not found.")
+            rows = await session.execute(
+                select(ProductProjectLink.project_id).where(ProductProjectLink.product_id == prod.id)
+            )
+            proj_ids = [int(r[0]) for r in rows.fetchall()]
+            if not proj_ids:
+                return []
+            result = await session.execute(
+                text(
+                    """
+                    SELECT m.id, m.subject, m.body_md, m.importance, m.ack_required, m.created_ts,
+                           m.thread_id, a.name AS sender_name, m.project_id
+                    FROM fts_messages
+                    JOIN messages m ON fts_messages.rowid = m.id
+                    JOIN agents a ON m.sender_id = a.id
+                    WHERE m.project_id IN :proj_ids AND fts_messages MATCH :query
+                    ORDER BY bm25(fts_messages) ASC
+                    LIMIT :limit
+                    """
+                ).bindparams(bindparam("proj_ids", expanding=True)),
+                {"proj_ids": proj_ids, "query": query, "limit": limit},
+            )
+            return [dict(row) for row in result.mappings().all()]
+    rows = asyncio.run(_run())
+    if not rows:
+        console.print("[yellow]No results.[/]")
+        return
+    t = Table(title=f"Product search: '{query}'", show_lines=False)
+    t.add_column("project_id")
+    t.add_column("id")
+    t.add_column("subject")
+    t.add_column("from")
+    t.add_column("created_ts")
+    for r in rows:
+        t.add_row(str(r["project_id"]), str(r["id"]), r["subject"], r["sender_name"], r["created_ts"].isoformat() if hasattr(r["created_ts"], "isoformat") else str(r["created_ts"]))
+    console.print(t)
+
+
+@products_app.command("inbox")
+def products_inbox(
+    product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
+    agent: Annotated[str, typer.Argument(..., help="Agent name")],
+    limit: Annotated[int, typer.Option("--limit", "-l", help="Max messages",)] = 20,
+    urgent_only: Annotated[bool, typer.Option("--urgent-only/--all", help="Only high/urgent")] = False,
+    include_bodies: Annotated[bool, typer.Option("--include-bodies/--no-bodies", help="Include body_md")] = False,
+    since_ts: Annotated[Optional[str], typer.Option("--since-ts", help="ISO-8601 timestamp filter")] = None,
+) -> None:
+    """
+    Fetch recent inbox messages for an agent across all projects in a product.
+    Prefers server tool; falls back to local DB when server is not reachable.
+    """
+    settings = get_settings()
+    server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
+    bearer = settings.http.bearer_token or os.environ.get("HTTP_BEARER_TOKEN", "")
+    # Try server first
+    try:
+        with httpx.Client(timeout=5.0) as client:
+            headers = {}
+            if bearer:
+                headers["Authorization"] = f"Bearer {bearer}"
+            req = {
+                "jsonrpc": "2.0",
+                "id": "cli-products-inbox",
+                "method": "tools/call",
+                "params": {
+                    "name": "fetch_inbox_product",
+                    "arguments": {
+                        "product_key": product_key,
+                        "agent_name": agent,
+                        "limit": int(limit),
+                        "urgent_only": bool(urgent_only),
+                        "include_bodies": bool(include_bodies),
+                        "since_ts": since_ts or "",
+                    },
+                },
+            }
+            resp = client.post(server_url, json=req, headers=headers)
+            data = resp.json()
+            result = (data or {}).get("result")
+            rows = result if isinstance(result, list) else []
+    except Exception:
+        rows = []
+    if not rows:
+        # Fallback: local DB
+        async def _fallback() -> list[dict]:
+            await ensure_schema()
+            async with get_session() as session:
+                prod = (await session.execute(select(Product).where((Product.product_uid == product_key) | (Product.name == product_key)))).scalars().first()
+                if prod is None:
+                    return []
+                proj_rows = await session.execute(
+                    select(Project).join(ProductProjectLink, ProductProjectLink.project_id == Project.id).where(
+                        ProductProjectLink.product_id == prod.id
+                    )
+                )
+                projects = list(proj_rows.scalars().all())
+                items: list[dict] = []
+                for proj in projects:
+                    agent_row = (await session.execute(select(Agent).where(Agent.project_id == proj.id, Agent.name == agent))).scalars().first()
+                    if not agent_row:
+                        continue
+                    from sqlalchemy.orm import aliased as _aliased  # local to avoid top-level churn
+                    sender_alias = _aliased(Agent)
+                    stmt = (
+                        select(Message, MessageRecipient.kind, sender_alias.name)
+                        .join(MessageRecipient, MessageRecipient.message_id == Message.id)
+                        .join(sender_alias, Message.sender_id == sender_alias.id)
+                        .where(Message.project_id == proj.id, MessageRecipient.agent_id == agent_row.id)
+                        .order_by(desc(Message.created_ts))
+                        .limit(limit)
+                    )
+                    if urgent_only:
+                        from typing import Any as _Any
+                        stmt = stmt.where(cast(_Any, Message.importance).in_(["high", "urgent"]))
+                    if since_ts:
+                        try:
+                            s = since_ts.strip()
+                            s = s[:-1] + "+00:00" if s.endswith("Z") else s
+                            from datetime import datetime as _dt
+                            since_dt = _dt.fromisoformat(s)
+                            stmt = stmt.where(Message.created_ts > since_dt)
+                        except Exception:
+                            pass
+                    res = await session.execute(stmt)
+                    for msg, kind, sender_name in res.all():
+                        payload = {
+                            "id": msg.id,
+                            "project_id": proj.id,
+                            "subject": msg.subject,
+                            "importance": msg.importance,
+                            "ack_required": msg.ack_required,
+                            "created_ts": msg.created_ts,
+                            "from": sender_name,
+                            "kind": kind,
+                        }
+                        if include_bodies:
+                            payload["body_md"] = msg.body_md
+                        items.append(payload)
+                # Sort desc by created_ts
+                items.sort(key=lambda r: r.get("created_ts") or 0, reverse=True)
+                return items[: max(0, int(limit))]
+        rows = asyncio.run(_fallback())
+    if not rows:
+        console.print("[yellow]No messages found.[/]")
+        return
+    t = Table(title=f"Inbox for {agent} in product '{product_key}'", show_lines=False)
+    t.add_column("project_id")
+    t.add_column("id")
+    t.add_column("subject")
+    t.add_column("from")
+    t.add_column("importance")
+    t.add_column("created_ts")
+    for r in rows:
+        created = r.get("created_ts")
+        if hasattr(created, "isoformat"):
+            created = created.isoformat()
+        t.add_row(str(r.get("project_id", "")), str(r.get("id", "")), str(r.get("subject", "")), str(r.get("from", "")), str(r.get("importance", "")), str(created or ""))
+    console.print(t)
+
+
+@products_app.command("summarize-thread")
+def products_summarize_thread(
+    product_key: Annotated[str, typer.Argument(..., help="Product uid or name")],
+    thread_id: Annotated[str, typer.Argument(..., help="Thread id or key")],
+    per_thread_limit: Annotated[int, typer.Option("--per-thread-limit", "-n", help="Max messages per thread",)] = 50,
+    no_llm: Annotated[bool, typer.Option("--no-llm", help="Disable LLM refinement")] = False,
+) -> None:
+    """
+    Summarize a thread across all projects in a product. Prefers server tool; minimal fallback if server is unavailable.
+    """
+    settings = get_settings()
+    server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
+    bearer = settings.http.bearer_token or os.environ.get("HTTP_BEARER_TOKEN", "")
+    # Try server
+    try:
+        with httpx.Client(timeout=8.0) as client:
+            headers = {}
+            if bearer:
+                headers["Authorization"] = f"Bearer {bearer}"
+            req = {
+                "jsonrpc": "2.0",
+                "id": "cli-products-summarize-thread",
+                "method": "tools/call",
+                "params": {
+                    "name": "summarize_thread_product",
+                    "arguments": {
+                        "product_key": product_key,
+                        "thread_id": thread_id,
+                        "include_examples": True,
+                        "llm_mode": (not no_llm),
+                        "per_thread_limit": int(per_thread_limit),
+                    },
+                },
+            }
+            resp = client.post(server_url, json=req, headers=headers)
+            data = resp.json()
+            result = (data or {}).get("result") or {}
+    except Exception:
+        result = {}
+    if not result:
+        console.print("[yellow]Server unavailable; summarization requires server tool. Try again when server is running.[/]")
+        raise typer.Exit(code=2)
+    # Pretty print
+    summary = result.get("summary") or {}
+    examples = result.get("examples") or []
+    table = Table(title=f"Thread summary: {thread_id}", show_lines=False)
+    table.add_column("Key")
+    table.add_column("Value")
+    table.add_row("participants", ", ".join(summary.get("participants", [])))
+    table.add_row("total_messages", str(summary.get("total_messages", "")))
+    table.add_row("open_actions", str(summary.get("open_actions", "")))
+    table.add_row("done_actions", str(summary.get("done_actions", "")))
+    console.print(table)
+    if summary.get("key_points"):
+        kp = Table(title="Key Points", show_lines=False)
+        kp.add_column("point")
+        for p in summary["key_points"]:
+            kp.add_row(str(p))
+        console.print(kp)
+    if summary.get("action_items"):
+        act = Table(title="Action Items", show_lines=False)
+        act.add_column("item")
+        for a in summary["action_items"]:
+            act.add_row(str(a))
+        console.print(act)
+    if examples:
+        ex = Table(title="Examples", show_lines=False)
+        ex.add_column("id")
+        ex.add_column("subject")
+        ex.add_column("from")
+        ex.add_column("created_ts")
+        for e in examples:
+            ex.add_row(str(e.get("id", "")), str(e.get("subject", "")), str(e.get("from", "")), str(e.get("created_ts", "")))
+        console.print(ex)
+
+
+async def _get_product_record(key: str) -> Product:
+    """Fetch Product by uid or name."""
+    await ensure_schema()
+    async with get_session() as session:
+        stmt = select(Product).where((Product.product_uid == key) | (Product.name == key))
+        result = await session.execute(stmt)
+        prod = result.scalars().first()
+        if not prod:
+            raise ValueError(f"Product '{key}' not found")
+        return prod
 
 
 @app.command("serve-http")
@@ -1364,9 +1791,466 @@ def _copy_bundle_contents(source: Path, destination: Path) -> None:
             shutil.copy2(src_file, dest_file)
 
 
+def _detect_project_root() -> Path:
+    cwd = Path.cwd().resolve()
+    candidates = [cwd, *cwd.parents]
+    for candidate in candidates:
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    for candidate in candidates:
+        if (candidate / ".git").exists():
+            return candidate
+    return cwd
+
+
+def _archive_states_dir(*, create: bool) -> Path:
+    root = _detect_project_root()
+    archive_dir = root / ARCHIVE_DIR_NAME
+    if create:
+        archive_dir.mkdir(parents=True, exist_ok=True)
+    return archive_dir
+
+
+def _package_version() -> str:
+    try:
+        return importlib_metadata.version("mcp-agent-mail")
+    except importlib_metadata.PackageNotFoundError:  # pragma: no cover - dev installs
+        return "0.0.0+local"
+
+
+def _format_bytes(value: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    current = float(max(value, 0))
+    for unit in units:
+        if current < 1024.0 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(current)} {unit}"
+            return f"{current:.1f} {unit}"
+        current /= 1024.0
+    return f"{int(value)} B"
+
+
+def _detect_git_head(repo_path: Path) -> str | None:
+    git_dir = repo_path / ".git"
+    if not git_dir.exists():
+        return None
+    head_path = git_dir / "HEAD"
+    try:
+        head_contents = head_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not head_contents:
+        return None
+    if head_contents.startswith("ref:"):
+        ref_name = head_contents.split(" ", 1)[1].strip()
+        ref_path = git_dir / ref_name
+        if ref_path.exists():
+            with suppress(OSError):
+                return ref_path.read_text(encoding="utf-8").strip()
+        packed_refs = git_dir / "packed-refs"
+        if packed_refs.exists():
+            with suppress(OSError):
+                for line in packed_refs.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("#") or not line.strip():
+                        continue
+                    commit, ref = line.split(" ", 1)
+                    if ref.strip() == ref_name:
+                        return commit.strip()
+        return None
+    return head_contents
+
+
+def _compose_archive_basename(
+    *,
+    timestamp: datetime,
+    project_filters: Sequence[str],
+    scrub_preset: str,
+    label: str | None,
+) -> str:
+    ts_segment = timestamp.strftime("%Y%m%d-%H%M%SZ")
+    projects_segment = "-".join(slugify(value) for value in project_filters) if project_filters else "all-projects"
+    preset_segment = slugify(scrub_preset)
+    segments = ["mailbox-state", ts_segment, projects_segment, preset_segment]
+    if label:
+        segments.append(slugify(label))
+    return "-".join(seg for seg in segments if seg)
+
+
+def _ensure_unique_archive_path(base_dir: Path, base_name: str) -> Path:
+    candidate = base_dir / f"{base_name}.zip"
+    counter = 1
+    while candidate.exists():
+        candidate = base_dir / f"{base_name}-{counter:02d}.zip"
+        counter += 1
+    return candidate
+
+
+def _write_directory_to_zip(zip_file: ZipFile, source_dir: Path, arc_prefix: Path) -> None:
+    source_dir = source_dir.resolve()
+    if not source_dir.exists():
+        raise ShareExportError(f"Storage root {source_dir} does not exist; nothing to archive.")
+    prefix = arc_prefix.as_posix().rstrip("/") + "/"
+    zip_file.writestr(prefix, b"")
+    for path in source_dir.rglob("*"):
+        arcname = (arc_prefix / path.relative_to(source_dir)).as_posix()
+        if path.is_dir():
+            zip_file.writestr(arcname.rstrip("/") + "/", b"")
+        else:
+            zip_file.write(path, arcname=arcname)
+
+
+def _load_archive_metadata(zip_path: Path) -> tuple[dict[str, Any], str | None]:
+    try:
+        with ZipFile(zip_path, "r") as archive, archive.open(ARCHIVE_METADATA_FILENAME) as meta_file:
+            data = json.loads(meta_file.read().decode("utf-8"))
+            return cast(dict[str, Any], data), None
+    except KeyError:
+        return {}, f"{ARCHIVE_METADATA_FILENAME} missing"
+    except (OSError, json.JSONDecodeError) as exc:
+        return {}, f"Invalid metadata: {exc}"
+
+
+def _resolve_archive_path(candidate: Path | str) -> Path:
+    path = Path(candidate)
+    if path.exists():
+        return path.resolve()
+    archive_dir = _archive_states_dir(create=False)
+    fallback = archive_dir / path.name
+    if fallback.exists():
+        return fallback.resolve()
+    raise FileNotFoundError(f"Archive '{candidate}' not found (checked {path} and {fallback}).")
+
+
+def _next_backup_path(path: Path, timestamp: str) -> Path:
+    base = path.with_name(f"{path.name}.backup-{timestamp}")
+    candidate = base
+    counter = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.backup-{timestamp}-{counter:02d}")
+        counter += 1
+    return candidate
+
+
+def _create_mailbox_archive(
+    *,
+    project_filters: Sequence[str],
+    scrub_preset: str,
+    label: str | None,
+    status_message: str = "Creating mailbox archive...",
+) -> tuple[Path, dict[str, Any]]:
+    settings = get_settings()
+    database_path = resolve_sqlite_database_path(settings.database.url)
+    storage_root = _resolve_path(settings.storage.root)
+    if not storage_root.exists():
+        raise ShareExportError(f"Storage root {storage_root} does not exist; cannot archive.")
+    archive_dir = _archive_states_dir(create=True)
+    timestamp = datetime.now(timezone.utc).replace(microsecond=0)
+    base_name = _compose_archive_basename(
+        timestamp=timestamp,
+        project_filters=project_filters,
+        scrub_preset=scrub_preset,
+        label=label,
+    )
+    destination = _ensure_unique_archive_path(archive_dir, base_name)
+    status_ctx = console.status(status_message) if status_message else nullcontext()
+    with status_ctx, tempfile.TemporaryDirectory(prefix="mailbox-archive-") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        snapshot_path = temp_dir / ARCHIVE_SNAPSHOT_RELATIVE.name
+        context = create_snapshot_context(
+            source_database=database_path,
+            snapshot_path=snapshot_path,
+            project_filters=project_filters,
+            scrub_preset=scrub_preset,
+        )
+        metadata: dict[str, Any] = {
+            "version": 1,
+            "created_at": timestamp.isoformat(),
+            "archive": {
+                "filename": destination.name,
+                "directory": str(destination.parent),
+            },
+            "projects_requested": list(project_filters),
+            "projects_included": [
+                {"slug": record.slug, "human_key": record.human_key}
+                for record in context.scope.projects
+            ],
+            "projects_removed": context.scope.removed_count,
+            "scrub_preset": scrub_preset,
+            "scrub_summary": asdict(context.scrub_summary),
+            "fts_enabled": context.fts_enabled,
+            "database": {
+                "source_path": str(database_path),
+                "snapshot": ARCHIVE_SNAPSHOT_RELATIVE.as_posix(),
+                "size_bytes": snapshot_path.stat().st_size,
+            },
+            "storage": {
+                "source_path": str(storage_root),
+                "git_head": _detect_git_head(storage_root),
+                "archive_dir": ARCHIVE_STORAGE_DIRNAME.as_posix(),
+            },
+            "label": label or "",
+            "tooling": {
+                "package": "mcp-agent-mail",
+                "version": _package_version(),
+                "python": sys.version.split()[0],
+            },
+            "notes": [
+                "Restore with `mcp-agent-mail archive restore {filename}`".format(filename=destination.name)
+            ],
+        }
+        temp_zip_path = temp_dir / "mailbox-state.zip"
+        with ZipFile(temp_zip_path, "w", compression=ZIP_DEFLATED, compresslevel=9) as archive:
+            archive.writestr(
+                ARCHIVE_METADATA_FILENAME,
+                json.dumps(metadata, indent=2, sort_keys=True).encode("utf-8"),
+            )
+            archive.write(snapshot_path, arcname=ARCHIVE_SNAPSHOT_RELATIVE.as_posix())
+            _write_directory_to_zip(archive, storage_root, ARCHIVE_STORAGE_DIRNAME)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(temp_zip_path), str(destination))
+    return destination, metadata
+
+
+@archive_app.command(
+    "save",
+    help="Create a lossless ZIP that captures the SQLite snapshot and storage repo (default preset keeps ack/read state).",
+)
+def archive_save_state(
+    projects: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--project",
+            "-p",
+            help="Limit archive to specific project slugs or human keys (pass multiple times to include several).",
+        ),
+    ] = None,
+    scrub_preset: Annotated[
+        str,
+        typer.Option(
+            "--scrub-preset",
+            help="Scrub preset (archive keeps everything; standard/strict scrub secrets).",
+            case_sensitive=False,
+            show_default=True,
+        ),
+    ] = DEFAULT_ARCHIVE_SCRUB_PRESET,
+    label: Annotated[
+        Optional[str],
+        typer.Option("--label", "-l", help="Optional label appended to the archive filename (e.g., nightly, pre-reset)."),
+    ] = None,
+) -> None:
+    project_filters: Sequence[str] = tuple(projects or ())
+    preset = (scrub_preset or "standard").strip().lower()
+    if preset not in SCRUB_PRESETS:
+        console.print(
+            f"[red]Invalid scrub preset '{scrub_preset}'. Choose one of: {', '.join(SCRUB_PRESETS)}.[/]"
+        )
+        raise typer.Exit(code=1)
+    try:
+        archive_path, metadata = _create_mailbox_archive(
+            project_filters=project_filters,
+            scrub_preset=preset,
+            label=label,
+            status_message="Creating mailbox archive...",
+        )
+    except ShareExportError as exc:
+        console.print(f"[red]Failed to create mailbox archive:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    size_bytes = archive_path.stat().st_size if archive_path.exists() else 0
+    projects_desc = metadata.get("projects_requested") or ["all"]
+    console.print(f"[green]✓ Mailbox state saved to:[/] {archive_path}")
+    console.print(
+        f"[dim]Preset:[/] {metadata.get('scrub_preset', preset)} | [dim]Projects:[/] {', '.join(projects_desc)} | [dim]Size:[/] {_format_bytes(size_bytes)}"
+    )
+    console.print(f"[dim]Restore later with:[/] mcp-agent-mail archive restore {archive_path.name}")
+
+
+@archive_app.command(
+    "list",
+    help="Show saved mailbox states (with metadata) from the archived_mailbox_states directory.",
+)
+def archive_list_states(
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", min=0, help="Show only the most recent N archives."),
+    ] = 0,
+    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON instead of a table")] = False,
+) -> None:
+    archive_dir = _archive_states_dir(create=False)
+    if not archive_dir.exists():
+        console.print(f"[yellow]Archive directory {archive_dir} does not exist yet.[/]")
+        raise typer.Exit(code=0)
+    files = sorted(archive_dir.glob("*.zip"), key=lambda path: path.stat().st_mtime, reverse=True)
+    if not files:
+        console.print(f"[yellow]No saved mailbox states found under {archive_dir}.[/]")
+        raise typer.Exit(code=0)
+    if limit > 0:
+        files = files[:limit]
+    entries: list[dict[str, Any]] = []
+    for file_path in files:
+        metadata, error = _load_archive_metadata(file_path)
+        entry = {
+            "file": file_path.name,
+            "path": str(file_path),
+            "size_bytes": file_path.stat().st_size,
+            "created_at": metadata.get("created_at")
+            or datetime.fromtimestamp(file_path.stat().st_mtime, timezone.utc).isoformat(),
+            "scrub_preset": metadata.get("scrub_preset", ""),
+            "projects": metadata.get("projects_requested") or ["all"],
+        }
+        if error:
+            entry["error"] = error
+        entries.append(entry)
+    if json_output:
+        json.dump(entries, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    table = Table(title="Saved Mailbox States", show_lines=False)
+    table.add_column("File")
+    table.add_column("Created (UTC)")
+    table.add_column("Size")
+    table.add_column("Preset")
+    table.add_column("Projects")
+    table.add_column("Notes")
+    for entry in entries:
+        notes = entry.get("error", "")
+        table.add_row(
+            entry["file"],
+            entry["created_at"],
+            _format_bytes(int(entry["size_bytes"])),
+            entry.get("scrub_preset", ""),
+            ", ".join(entry.get("projects", [])),
+            notes,
+        )
+    console.print(table)
+    console.print(f"[dim]Archives live under {archive_dir}. Restore with `mcp-agent-mail archive restore <file>`.[/]")
+
+
+@archive_app.command(
+    "restore",
+    help="Restore a previously saved mailbox state. Existing DB/storage are backed up automatically.",
+)
+def archive_restore_state(
+    archive_file: Annotated[Path, typer.Argument(help="Path or filename of the saved state zip file.")],
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            "-f",
+            help="Apply the archive even if backups already exist (still keeps safety backups, just skips the prompt).",
+        ),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option(
+            "--dry-run",
+            help="Print the planned backup/restore steps without touching files (useful for audits).",
+        ),
+    ] = False,
+) -> None:
+    try:
+        archive_path = _resolve_archive_path(archive_file)
+    except FileNotFoundError as exc:
+        console.print(f"[red]{exc}[/]")
+        raise typer.Exit(code=1) from exc
+    metadata, meta_error = _load_archive_metadata(archive_path)
+    if meta_error:
+        console.print(f"[yellow]Warning:[/] {meta_error}")
+    try:
+        database_path = resolve_sqlite_database_path()
+    except ShareExportError as exc:
+        console.print(f"[red]Failed to resolve target database path:[/] {exc}")
+        raise typer.Exit(code=1) from exc
+    settings = get_settings()
+    storage_root = _resolve_path(settings.storage.root)
+    archive_db_path = metadata.get("database", {}).get("source_path")
+    archive_storage_path = metadata.get("storage", {}).get("source_path")
+    if archive_db_path and archive_db_path != str(database_path):
+        console.print(
+            f"[yellow]Archive was created from database {archive_db_path}, current config is {database_path}. Continuing...[/]"
+        )
+    if archive_storage_path and archive_storage_path != str(storage_root):
+        console.print(
+            f"[yellow]Archive used storage root {archive_storage_path}, current config is {storage_root}. Continuing...[/]"
+        )
+    with tempfile.TemporaryDirectory(prefix="mailbox-restore-") as temp_dir_str:
+        temp_dir = Path(temp_dir_str)
+        with ZipFile(archive_path, "r") as archive:
+            archive.extractall(temp_dir)
+        snapshot_src = temp_dir / ARCHIVE_SNAPSHOT_RELATIVE
+        storage_src = temp_dir / ARCHIVE_STORAGE_DIRNAME
+        if not snapshot_src.exists():
+            console.print(f"[red]Snapshot missing inside archive ({ARCHIVE_SNAPSHOT_RELATIVE}).[/]")
+            raise typer.Exit(code=1)
+        if not storage_src.exists():
+            console.print(f"[red]Storage repository missing inside archive ({ARCHIVE_STORAGE_DIRNAME}).[/]")
+            raise typer.Exit(code=1)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        planned_ops: list[str] = []
+        if database_path.exists():
+            planned_ops.append(f"backup {database_path} -> {_next_backup_path(database_path, timestamp)}")
+        for suffix in ("-wal", "-shm"):
+            wal_path = Path(f"{database_path}{suffix}")
+            if wal_path.exists():
+                planned_ops.append(f"backup {wal_path} -> {_next_backup_path(wal_path, timestamp)}")
+        if storage_root.exists():
+            planned_ops.append(f"backup {storage_root} -> {_next_backup_path(storage_root, timestamp)}")
+        planned_ops.append(f"restore snapshot -> {database_path}")
+        planned_ops.append(f"restore storage repo -> {storage_root}")
+        if dry_run:
+            console.print("[cyan]Dry-run plan:[/]")
+            for op in planned_ops:
+                console.print(f"  • {op}")
+            return
+        if not force:
+            console.print("[yellow]The following operations will be performed:[/]")
+            for op in planned_ops:
+                console.print(f"  • {op}")
+            if not typer.confirm("Proceed with restore?", default=False):
+                raise typer.Exit(code=1)
+        backup_paths: list[Path] = []
+        if database_path.exists():
+            db_backup = _next_backup_path(database_path, timestamp)
+            shutil.move(str(database_path), str(db_backup))
+            backup_paths.append(db_backup)
+        for suffix in ("-wal", "-shm"):
+            wal_path = Path(f"{database_path}{suffix}")
+            if wal_path.exists():
+                wal_backup = _next_backup_path(wal_path, timestamp)
+                shutil.move(str(wal_path), str(wal_backup))
+                backup_paths.append(wal_backup)
+        if storage_root.exists():
+            storage_backup = _next_backup_path(storage_root, timestamp)
+            shutil.move(str(storage_root), str(storage_backup))
+            backup_paths.append(storage_backup)
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(snapshot_src, database_path)
+        storage_root.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(storage_src, storage_root, dirs_exist_ok=False)
+    console.print(f"[green]✓ Restore complete from {archive_path}.[/]")
+    if backup_paths:
+        console.print("[dim]Backups preserved at:[/]")
+        for path in backup_paths:
+            console.print(f"  • {path}")
+    console.print(
+        f"[dim]Database:[/] {database_path}\n[dim]Storage root:[/] {storage_root}\n[dim]Need to revert? Use the backups above or rerun with another archive."
+    )
+
+
 @app.command("clear-and-reset-everything")
 def clear_and_reset_everything(
-    force: bool = typer.Option(False, "--force", "-f", help="Skip confirmation prompt."),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Skip the final destructive confirmation prompt (still asks about creating an archive).",
+    ),
+    archive_choice: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--archive/--no-archive",
+            help="Attempt a pre-reset archive before deleting data (default: prompt when interactive).",
+        ),
+    ] = None,
 ) -> None:
     """
     Delete the SQLite database (including WAL/SHM) and wipe all storage-root contents.
@@ -1400,8 +2284,36 @@ def clear_and_reset_everything(
             console.print("  • (no SQLite files detected)")
         console.print(f"  • All contents inside {storage_root} (including .git)")
         console.print()
-        if not typer.confirm("Proceed?"):
-            raise typer.Exit(code=1)
+
+    archived_state: Path | None = None
+    should_archive = archive_choice if archive_choice is not None else None
+    archive_mandatory = archive_choice is True or force
+    if should_archive is None:
+        if force:
+            should_archive = True
+        else:
+            should_archive = typer.confirm("Create a mailbox archive before wiping everything?", default=True)
+    if should_archive:
+        try:
+            archived_state, _ = _create_mailbox_archive(
+                project_filters=(),
+                scrub_preset=DEFAULT_ARCHIVE_SCRUB_PRESET,
+                label="pre-reset",
+                status_message="Archiving current mailbox before reset...",
+            )
+            console.print(f"[green]✓ Saved restore point to:[/] {archived_state}")
+            console.print(
+                f"[dim]Restore later with:[/] mcp-agent-mail archive restore {archived_state.name}"
+            )
+        except ShareExportError as exc:
+            console.print(f"[red]Failed to create archive:[/] {exc}")
+            if archive_mandatory:
+                raise typer.Exit(code=1) from exc
+            if not typer.confirm("Archive failed. Continue without a backup?", default=False):
+                raise typer.Exit(code=1) from exc
+
+    if not force and not typer.confirm("Proceed with destructive reset?", default=False):
+        raise typer.Exit(code=1)
 
     # Remove database files
     deleted_db_files: list[Path] = []
@@ -1551,11 +2463,32 @@ def guard_uninstall(
 
     repo_path = repo.expanduser().resolve()
     removed = asyncio.run(uninstall_guard_script(repo_path))
-    hook_path = repo_path / ".git" / "hooks" / "pre-commit"
-    if removed:
-        console.print(f"[green]Removed guard at {hook_path}.")
+    # Resolve hooks directory for accurate messaging
+    def _git(cwd: Path, *args: str) -> str | None:
+        try:
+            cp = subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
+            return cp.stdout.strip()
+        except Exception:
+            return None
+    hooks_path = _git(repo_path, "config", "--get", "core.hooksPath")
+    if hooks_path:
+        if hooks_path.startswith("/") or (((((len(hooks_path) > 1) and (hooks_path[1:3] == ":\\")) or (hooks_path[1:3] == ":/")))):
+            hooks_dir = Path(hooks_path)
+        else:
+            root = _git(repo_path, "rev-parse", "--show-toplevel") or str(repo_path)
+            hooks_dir = Path(root) / hooks_path
     else:
-        console.print(f"[yellow]No guard found at {hook_path}.")
+        git_dir = _git(repo_path, "rev-parse", "--git-dir") or ".git"
+        g = Path(git_dir)
+        if not g.is_absolute():
+            g = repo_path / g
+        hooks_dir = g / "hooks"
+    pre_commit = hooks_dir / "pre-commit"
+    pre_push = hooks_dir / "pre-push"
+    if removed:
+        console.print(f"[green]Removed guard scripts at {pre_commit} and (if present) {pre_push}.")
+    else:
+        console.print(f"[yellow]No guard scripts found at {hooks_dir}.")
 
 
 @file_reservations_app.command("list")
@@ -1646,9 +2579,12 @@ def amctl_env(
 @app.command(name="am-run")
 def am_run(
     slot: Annotated[str, typer.Argument(help="Build slot name (e.g., frontend-build)")],
-    cmd: Annotated[list[str], typer.Argument(help="Command to run", nargs=-1)],
+    cmd: Annotated[list[str], typer.Argument(help="Command to run")],
     project_path: Annotated[Path, typer.Option("--path", "-p", help="Path to repo/worktree",)] = Path(),
     agent: Annotated[Optional[str], typer.Option("--agent", "-a", help="Agent name (defaults to $AGENT_NAME)")] = None,
+    ttl_seconds: Annotated[int, typer.Option("--ttl-seconds", help="Lease TTL seconds (default 3600)")] = 3600,
+    shared: Annotated[bool, typer.Option("--shared/--exclusive", help="Shared (non-exclusive) lease",)] = False,
+    block_on_conflicts: Annotated[bool, typer.Option("--block-on-conflicts/--no-block-on-conflicts", help="Exit 1 if exclusive conflicts are present")] = False,
 ) -> None:
     """
     Build wrapper that prepares environment variables and manages a build slot:
@@ -1663,6 +2599,8 @@ def am_run(
     slug = ident["slug"]
     project_uid = ident["project_uid"]
     branch = ident.get("branch") or ""
+    # Always ensure archive structure exists (for tests and local runs)
+    asyncio.run(ensure_archive(get_settings(), slug))
     if not branch:
         try:
             from git import Repo as _Repo
@@ -1676,6 +2614,8 @@ def am_run(
     settings = get_settings()
     guard_mode = (os.environ.get("AGENT_MAIL_GUARD_MODE", "block") or "block").strip().lower()
     worktrees_enabled = bool(settings.worktrees_enabled)
+    server_url = f"http://{settings.http.host}:{settings.http.port}{settings.http.path}"
+    bearer = settings.http.bearer_token or os.environ.get("HTTP_BEARER_TOKEN", "")
 
     def _safe_component(value: str) -> str:
         s = value.strip()
@@ -1710,6 +2650,23 @@ def am_run(
     def _lease_path(slot_dir: Path) -> Path:
         holder = _safe_component(f"{agent_name}__{branch or 'unknown'}")
         return slot_dir / f"{holder}.json"
+    # Ensure local lease path exists upfront so tests can observe it even if server path is used
+    lease_path: Optional[Path] = None
+    try:
+        slot_dir_eager = asyncio.run(_ensure_slot_paths())
+        lease_path = _lease_path(slot_dir_eager)
+        payload = {
+            "slot": slot,
+            "agent": agent_name,
+            "branch": branch,
+            "exclusive": (not shared),
+            "acquired_ts": datetime.now(timezone.utc).isoformat(),
+            "expires_ts": (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
+        }
+        with suppress(Exception):
+            lease_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
     env = os.environ.copy()
     env.update({
         "AM_SLOT": slot,
@@ -1719,70 +2676,178 @@ def am_run(
         "AGENT": agent_name,
         "CACHE_KEY": f"am-cache-{project_uid}-{agent_name}-{branch}",
     })
-    lease_path: Optional[Path] = None
+    # lease_path may already be set by eager creation above
     renew_stop = threading.Event()
     renew_thread: Optional[threading.Thread] = None
-    ttl_seconds = 3600
     try:
         if worktrees_enabled:
-            slot_dir = asyncio.run(_ensure_slot_paths())
-            active = _read_active(slot_dir)
-            conflicts = [
-                e for e in active
-                if e.get("exclusive", True) and not (e.get("agent") == agent_name and e.get("branch") == branch)
-            ]
-            if conflicts and guard_mode == "warn":
-                console.print("[yellow]Build slot conflicts (advisory, proceeding):[/]")
-                for c in conflicts:
-                    console.print(
-                        f"  - slot={c.get('slot','')} agent={c.get('agent','')} "
-                        f"branch={c.get('branch','')} expires={c.get('expires_ts','')}"
-                    )
-            lease_path = _lease_path(slot_dir)
-            payload = {
-                "slot": slot,
-                "agent": agent_name,
-                "branch": branch,
-                "exclusive": True,
-                "acquired_ts": datetime.now(timezone.utc).isoformat(),
-                "expires_ts": (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
-            }
-            with suppress(Exception):
-                lease_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-            def _renewer() -> None:
-                interval = max(60, ttl_seconds // 2)
-                while not renew_stop.wait(interval):
-                    try:
-                        now = datetime.now(timezone.utc)
-                        new_exp = now + timedelta(seconds=max(60, ttl_seconds // 2))
+            # Prefer server tools (authority); fallback to local FS leases
+            use_server = True
+            try:
+                with httpx.Client(timeout=5.0) as client:
+                    headers = {}
+                    if bearer:
+                        headers["Authorization"] = f"Bearer {bearer}"
+                    req = {
+                        "jsonrpc": "2.0",
+                        "id": "am-run-ensure",
+                        "method": "tools/call",
+                        "params": {"name": "ensure_project", "arguments": {"human_key": str(p)}},
+                    }
+                    client.post(server_url, json=req, headers=headers)
+            except Exception:
+                use_server = False
+
+            if use_server:
+                conflicts: list[dict[str, Any]] = []
+                try:
+                    with httpx.Client(timeout=5.0) as client:
+                        headers = {}
+                        if bearer:
+                            headers["Authorization"] = f"Bearer {bearer}"
+                        req = {
+                            "jsonrpc": "2.0",
+                            "id": "am-run-acquire",
+                            "method": "tools/call",
+                            "params": {
+                                "name": "acquire_build_slot",
+                                "arguments": {
+                                    "project_key": str(p),
+                                    "agent_name": agent_name,
+                                    "slot": slot,
+                                    "ttl_seconds": int(ttl_seconds),
+                                    "exclusive": (not shared),
+                                },
+                            },
+                        }
+                        resp = client.post(server_url, json=req, headers=headers)
+                        data = resp.json()
+                        result = (data or {}).get("result") or {}
+                        conflicts = list(result.get("conflicts") or [])
+                except Exception:
+                    use_server = False
+
+                if conflicts and guard_mode == "warn":
+                    console.print("[yellow]Build slot conflicts (server advisory, proceeding):[/]")
+                    for c in conflicts:
+                        console.print(
+                            f"  - slot={c.get('slot','')} agent={c.get('agent','')} "
+                            f"branch={c.get('branch','')} expires={c.get('expires_ts','')}"
+                        )
+                if conflicts and (not shared) and block_on_conflicts:
+                    console.print("[red]Build slot conflicts detected and --block-on-conflicts set; aborting.[/]")
+                    raise typer.Exit(code=1)
+
+                def _renewer_srv() -> None:
+                    interval = max(60, ttl_seconds // 2)
+                    while not renew_stop.wait(interval):
                         try:
-                            current = json.loads(lease_path.read_text(encoding="utf-8")) if lease_path else {}
+                            with httpx.Client(timeout=5.0) as client:
+                                headers = {}
+                                if bearer:
+                                    headers["Authorization"] = f"Bearer {bearer}"
+                                req = {
+                                    "jsonrpc": "2.0",
+                                    "id": "am-run-renew",
+                                    "method": "tools/call",
+                                    "params": {
+                                        "name": "renew_build_slot",
+                                        "arguments": {
+                                            "project_key": str(p),
+                                            "agent_name": agent_name,
+                                            "slot": slot,
+                                            "extend_seconds": max(60, ttl_seconds // 2),
+                                        },
+                                    },
+                                }
+                                client.post(server_url, json=req, headers=headers)
                         except Exception:
-                            current = {}
-                        current.update({"expires_ts": new_exp.isoformat()})
-                        if lease_path:
-                            lease_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
-                    except Exception:
-                        continue
-            renew_thread = threading.Thread(target=_renewer, name="am-run-renew", daemon=True)
-            renew_thread.start()
+                            continue
+
+                renew_thread = threading.Thread(target=_renewer_srv, name="am-run-renew", daemon=True)
+                renew_thread.start()
+
+            if not use_server:
+                slot_dir = asyncio.run(_ensure_slot_paths())
+                active = _read_active(slot_dir)
+                conflicts = [
+                    e for e in active
+                    if e.get("exclusive", True) and not shared and not (e.get("agent") == agent_name and e.get("branch") == branch)
+                ]
+                if conflicts and guard_mode == "warn":
+                    console.print("[yellow]Build slot conflicts (advisory, proceeding):[/]")
+                    for c in conflicts:
+                        console.print(
+                            f"  - slot={c.get('slot','')} agent={c.get('agent','')} "
+                            f"branch={c.get('branch','')} expires={c.get('expires_ts','')}"
+                        )
+                if conflicts and (not shared) and block_on_conflicts:
+                    console.print("[red]Build slot conflicts detected and --block-on-conflicts set; aborting.[/]")
+                    raise typer.Exit(code=1)
+                lease_path = _lease_path(slot_dir)
+                payload = {
+                    "slot": slot,
+                    "agent": agent_name,
+                    "branch": branch,
+                    "exclusive": (not shared),
+                    "acquired_ts": datetime.now(timezone.utc).isoformat(),
+                    "expires_ts": (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat(),
+                }
+                with suppress(Exception):
+                    lease_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+                def _renewer() -> None:
+                    interval = max(60, ttl_seconds // 2)
+                    while not renew_stop.wait(interval):
+                        try:
+                            now = datetime.now(timezone.utc)
+                            new_exp = now + timedelta(seconds=max(60, ttl_seconds // 2))
+                            try:
+                                current = json.loads(lease_path.read_text(encoding="utf-8")) if lease_path else {}
+                            except Exception:
+                                current = {}
+                            current.update({"expires_ts": new_exp.isoformat()})
+                            if lease_path:
+                                lease_path.write_text(json.dumps(current, indent=2), encoding="utf-8")
+                        except Exception:
+                            continue
+                renew_thread = threading.Thread(target=_renewer, name="am-run-renew", daemon=True)
+                renew_thread.start()
         console.print(f"[cyan]$ {' '.join(cmd)}[/]  [dim](slot={slot})[/]")
         rc = subprocess.run(list(cmd), env=env, check=False).returncode
     except FileNotFoundError:
         rc = 127
     finally:
-        if worktrees_enabled and lease_path:
+        if worktrees_enabled:
+            # Attempt server release; fallback to local lease release
             try:
-                now = datetime.now(timezone.utc)
-                try:
-                    data = json.loads(lease_path.read_text(encoding="utf-8"))
-                except Exception:
-                    data = {}
-                data.update({"released_ts": now.isoformat(), "expires_ts": now.isoformat()})
-                with suppress(Exception):
-                    lease_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                with httpx.Client(timeout=5.0) as client:
+                    headers = {}
+                    if bearer:
+                        headers["Authorization"] = f"Bearer {bearer}"
+                    req = {
+                        "jsonrpc": "2.0",
+                        "id": "am-run-release",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "release_build_slot",
+                            "arguments": {"project_key": str(p), "agent_name": agent_name, "slot": slot},
+                        },
+                    }
+                    client.post(server_url, json=req, headers=headers)
             except Exception:
-                pass
+                if lease_path:
+                    try:
+                        now = datetime.now(timezone.utc)
+                        try:
+                            data = json.loads(lease_path.read_text(encoding="utf-8"))
+                        except Exception:
+                            data = {}
+                        data.update({"released_ts": now.isoformat(), "expires_ts": now.isoformat()})
+                        with suppress(Exception):
+                            lease_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+                    except Exception:
+                        pass
             finally:
                 renew_stop.set()
                 if renew_thread and renew_thread.is_alive():
@@ -1790,6 +2855,59 @@ def am_run(
     if rc != 0:
         raise typer.Exit(code=rc)
 
+@projects_app.command("mark-identity")
+def projects_mark_identity(
+    project_path: Annotated[Path, typer.Argument(..., help="Path to repo/worktree ('.' for current)")],
+    commit: Annotated[bool, typer.Option("--commit/--no-commit", help="Write committed marker .agent-mail-project-id")] = True,
+) -> None:
+    """
+    Write the current project_uid into a marker file (.agent-mail-project-id).
+    """
+    p = project_path.expanduser().resolve()
+    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident  # type: ignore
+    ident = _resolve_ident(str(p))
+    uid = ident.get("project_uid") or ""
+    if not uid:
+        raise typer.BadParameter("Unable to resolve project_uid for this path.")
+    # Determine repo root
+    try:
+        from git import Repo as _Repo
+        repo = _Repo(str(p), search_parent_directories=True)
+        root = Path(repo.working_tree_dir or str(p))
+    except Exception:
+        root = p
+    marker_path = root / ".agent-mail-project-id"
+    marker_path.write_text(uid + "\n", encoding="utf-8")
+    console.print(f"[green]Wrote[/] {marker_path} with project_uid={uid}")
+    if commit:
+        try:
+            subprocess.run(["git", "-C", str(root), "add", str(marker_path)], check=True)
+            subprocess.run(["git", "-C", str(root), "commit", "-m", "chore: add .agent-mail-project-id"], check=True)
+            console.print("[green]Committed marker file.[/]")
+        except Exception:
+            console.print("[yellow]Unable to commit marker automatically. Please commit manually.[/]")
+
+
+@projects_app.command("discovery-init")
+def projects_discovery_init(
+    project_path: Annotated[Path, typer.Argument(..., help="Path to repo/worktree ('.' for current)")],
+    product: Annotated[Optional[str], typer.Option("--product", "-P", help="Optional product_uid")] = None,
+) -> None:
+    """
+    Scaffold a discovery YAML file (.agent-mail.yaml) with project_uid (and optional product_uid).
+    """
+    p = project_path.expanduser().resolve()
+    from mcp_agent_mail.app import _resolve_project_identity as _resolve_ident  # type: ignore
+    ident = _resolve_ident(str(p))
+    uid = ident.get("project_uid") or ""
+    if not uid:
+        raise typer.BadParameter("Unable to resolve project_uid for this path.")
+    ypath = p / ".agent-mail.yaml"
+    lines = ["# Agent Mail discovery file", f"project_uid: {uid}"]
+    if product:
+        lines.append(f"product_uid: {product}")
+    ypath.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    console.print(f"[green]Wrote[/] {ypath}")
 @mail_app.command("status")
 def mail_status(
     project_path: Annotated[
@@ -1913,6 +3031,140 @@ def guard_status(
     table.add_row("pre-push", "present" if pre_push.exists() else "missing")
     console.print(table)
 
+@guard_app.command("check")
+def guard_check(
+    stdin_nul: bool = typer.Option(False, "--stdin-nul", help="Read NUL-delimited paths from STDIN"),
+    advisory: bool = typer.Option(False, "--advisory", help="Advisory mode: print conflicts but exit 0"),
+    repo: Annotated[Optional[Path], typer.Option("--repo", help="Path to git repo (defaults to detected root)")] = None,
+) -> None:
+    """
+    Check paths (from STDIN when --stdin-nul) against active exclusive file_reservations.
+
+    Unifies guard semantics across hooks and CLI:
+    - Normalizes paths to repo-root relative, honoring core.ignorecase
+    - Uses Git wildmatch semantics via pathspec when available, with fnmatch fallback
+    - Prints conflicts and returns non-zero unless --advisory is set
+    """
+    settings = get_settings()
+    agent_name = os.environ.get("AGENT_NAME")
+    if not agent_name:
+        console.print("[red]AGENT_NAME environment variable is required.[/]")
+        raise typer.Exit(code=1)
+
+    def _git(cwd: Path, *args: str) -> str | None:
+        try:
+            cp = subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
+            return cp.stdout.strip()
+        except Exception:
+            return None
+
+    if repo is not None:
+        repo_root = repo.expanduser().resolve()
+    else:
+        guess = _git(Path.cwd(), "rev-parse", "--show-toplevel")
+        repo_root = Path(guess).expanduser().resolve() if guess else Path.cwd().expanduser().resolve()
+
+    # Map repo path to project archive
+    try:
+        from mcp_agent_mail.app import _compute_project_slug as _compute_slug  # type: ignore
+    except Exception:
+        console.print("[red]Internal error: cannot import slug helper.[/]")
+        raise typer.Exit(code=1) from None
+    slug_value = _compute_slug(str(repo_root))
+    archive = asyncio.run(ensure_archive(settings, slug_value))
+
+    # Read NUL-delimited paths from STDIN
+    paths: list[str] = []
+    if stdin_nul:
+        data = sys.stdin.buffer.read()
+        if data:
+            items = [p for p in data.decode("utf-8", "ignore").split("\x00") if p]
+            # De-duplicate while preserving order
+            seen = set()
+            for p in items:
+                if p not in seen:
+                    seen.add(p)
+                    paths.append(p)
+    if not paths:
+        raise typer.Exit(code=0)
+
+    # Matching semantics
+    ignorecase = False
+    ic = _git(repo_root, "config", "--get", "core.ignorecase")
+    if ic and ic.strip().lower() == "true":
+        ignorecase = True
+    try:
+        from pathspec import PathSpec as _PS  # type: ignore
+    except Exception:
+        _PS = None  # type: ignore
+    import fnmatch as _fn
+
+    def _normalize(p: str) -> str:
+        s = p.replace("\\", "/").lstrip("/")
+        return s.lower() if ignorecase else s
+
+    def _compile(pattern: str):
+        patt = pattern.lower() if ignorecase else pattern
+        if _PS is not None:
+            try:
+                return _PS.from_lines("gitwildmatch", [patt])
+            except Exception:
+                return None
+        return None
+
+    def _match(spec, a: str, b: str) -> bool:
+        aa = _normalize(a)
+        bb = _normalize(b)
+        if spec is not None:
+            try:
+                return bool(spec.match_file(aa))
+            except Exception:
+                pass
+        return _fn.fnmatchcase(aa, bb) or _fn.fnmatchcase(bb, aa) or (aa == bb)
+
+    fr_dir = archive.root / "file_reservations"
+    if not fr_dir.exists():
+        raise typer.Exit(code=0)
+    now = datetime.now(timezone.utc)
+    conflicts: list[tuple[str, str, str]] = []
+
+    for candidate in sorted(fr_dir.glob("*.json")):
+        try:
+            data = json.loads(candidate.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if data.get("agent") == agent_name:
+            continue
+        if not data.get("exclusive", True):
+            continue
+        expires = data.get("expires_ts")
+        if expires:
+            try:
+                if datetime.fromisoformat(expires) < now:
+                    continue
+            except Exception:
+                pass
+        pattern = (data.get("path_pattern") or "").strip()
+        if not pattern:
+            continue
+        spec = _compile(pattern)
+        for path_value in paths:
+            if _match(spec, path_value, pattern):
+                conflicts.append((path_value, data.get("agent", ""), pattern))
+
+    if conflicts:
+        console.print("[red]Exclusive file_reservation conflicts detected:[/]")
+        for path_value, agent, pattern in conflicts:
+            console.print(f"  - {path_value} matches file_reservation '{pattern}' held by [bold]{agent}[/]")
+        if advisory:
+            console.print("[yellow]Advisory mode: not blocking (set AGENT_MAIL_GUARD_MODE=block to enforce).[/]")
+            raise typer.Exit(code=0)
+        else:
+            console.print("[yellow]Resolve conflicts or release file_reservations before proceeding.[/]")
+            console.print("[dim]Hints: set AGENT_MAIL_GUARD_MODE=warn for advisory, or AGENT_MAIL_BYPASS=1 to bypass in emergencies.[/]")
+            raise typer.Exit(code=1)
+    raise typer.Exit(code=0)
+
 @projects_app.command("adopt")
 def projects_adopt(
     source: Annotated[str, typer.Argument(..., help="Old project slug or human key")],
@@ -1920,14 +3172,15 @@ def projects_adopt(
     dry_run: Annotated[bool, typer.Option("--dry-run/--apply", help="Show plan without applying changes.")] = True,
 ) -> None:
     """
-    Plan consolidation of legacy per-worktree projects into a canonical project.
-    NOTE: Apply is not yet implemented; this command currently prints a dry-run only.
+    Plan and optionally apply consolidation of legacy per-worktree projects into a canonical project.
     """
     async def _load(slug_or_key: str) -> Project:
         return await _get_project_record(slug_or_key)
 
     try:
-        src, dst = asyncio.run(asyncio.gather(_load(source), _load(target)))
+        async def _both() -> tuple[Project, Project]:
+            return await asyncio.gather(_load(source), _load(target))  # type: ignore[return-value]
+        src, dst = asyncio.run(_both())
     except Exception as exc:
         raise typer.BadParameter(str(exc)) from exc
 
